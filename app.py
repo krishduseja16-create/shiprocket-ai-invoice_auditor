@@ -719,30 +719,43 @@ if run_audit_btn and invoice_file:
     st.markdown("## 📊 Audit Report")
 
     # Metrics row
-    errors   = sum(1 for f in findings if f["severity"] == "ERROR")
-    warnings = sum(1 for f in findings if f["severity"] == "WARNING")
-    infos    = sum(1 for f in findings if f["severity"] == "INFO")
-    status   = "FAIL" if errors else ("REVIEW" if warnings else "PASS")
-    status_color = "#ef4444" if errors else ("#f59e0b" if warnings else "#22c55e")
+errors   = sum(1 for f in findings if f["severity"] == "ERROR")
+warnings = sum(1 for f in findings if f["severity"] == "WARNING")
+infos    = sum(1 for f in findings if f["severity"] == "INFO")
+status   = "FAIL" if errors else ("REVIEW" if warnings else "PASS")
+status_color = "#ef4444" if errors else ("#f59e0b" if warnings else "#22c55e")
 
-    m1, m2, m3, m4, m5 = st.columns(5)
-    metrics = [
-        (status, "Audit Status", status_color),
-        (str(errors), "Errors", "#ef4444"),
-        (str(warnings), "Warnings", "#f59e0b"),
-        (f"₹{invoice_data.get('total_amount') or 0:,.2f}", "Total Billed", "#4f8ef7"),
-        (invoice_data.get("awb_number") or "—", "AWB Number", "#7c3aed"),
-    ]
-    for col, (val, label, color) in zip([m1, m2, m3, m4, m5], metrics):
-        with col:
-            st.markdown(
-                f"""<div class='metric-box'>
-                  <div class='metric-value' style='color:{color}'>{val}</div>
-                  <div class='metric-label'>{label}</div>
-                </div>""",
-                unsafe_allow_html=True,
-            )
+# Calculate total overcharge detected
+total_overcharge = 0
+for f in findings:
+    if f.get("difference"):
+        try:
+            diff = float(str(f["difference"]).replace("₹", "").replace("+", ""))
+            if diff > 0:
+                total_overcharge += diff
+        except:
+            pass
 
+m1, m2, m3, m4, m5, m6 = st.columns(6)
+
+metrics = [
+    (status, "Audit Status", status_color),
+    (str(errors), "Errors", "#ef4444"),
+    (str(warnings), "Warnings", "#f59e0b"),
+    (f"₹{invoice_data.get('total_amount') or 0:,.2f}", "Total Billed", "#4f8ef7"),
+    (f"₹{total_overcharge:,.2f}", "Overcharge Detected", "#ef4444"),
+    (invoice_data.get("awb_number") or "—", "AWB Number", "#7c3aed"),
+]
+
+for col, (val, label, color) in zip([m1, m2, m3, m4, m5, m6], metrics):
+    with col:
+        st.markdown(
+            f"""<div class='metric-box'>
+              <div class='metric-value' style='color:{color}'>{val}</div>
+              <div class='metric-label'>{label}</div>
+            </div>""",
+            unsafe_allow_html=True,
+        )
     st.markdown("<br>", unsafe_allow_html=True)
 
     # Two-column: extracted fields + findings
