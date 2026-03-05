@@ -1,5 +1,6 @@
 """
-AI Invoice Auditor for Shiprocket Logistics Invoices
+AI Invoice Auditor
+Automated Logistics Invoice Audit Tool
 """
 
 import streamlit as st
@@ -8,276 +9,429 @@ import re
 import io
 import hashlib
 from datetime import datetime
-from typing import Optional
 
-try:
-    import pytesseract
-    from PIL import Image
-    from pdf2image import convert_from_bytes
-    OCR_AVAILABLE = True
-except ImportError:
-    OCR_AVAILABLE = False
+import pytesseract
+from PIL import Image
+from pdf2image import convert_from_bytes
 
-try:
-    import anthropic
-    ANTHROPIC_AVAILABLE = True
-except ImportError:
-    ANTHROPIC_AVAILABLE = False
+# --------------------------------------------------
+# CONFIG
+# --------------------------------------------------
 
+GST_RATE = 0.18
+COD_MIN = 50  # Real market minimum: ₹30-50, using ₹50 as conservative
+
+# Real approximate market rates via Shiprocket (per kg slab, surface/standard)
+# Source: edesy.in rate comparison + Shiprocket published estimates (2025)
+# Note: Actual rates vary by zone (local/regional/national) and volume contract.
+# These are indicative national-zone rates for audit reference.
 RATE_CARD = {
+
     "BlueDart": {
-        "slabs": [(0.5,45),(1.0,65),(2.0,85),(5.0,120),(10.0,180),(float("inf"),220)],
-        "cod_charge_pct": 1.5, "excess_weight_per_kg": 18,
+        # Premium courier — highest rates, fastest delivery
+        # Base ₹72 + ₹26/kg approx from edesy comparison
+        "slabs": [
+            (0.5,  98),
+            (1.0,  130),
+            (2.0,  175),
+            (5.0,  290),
+            (10.0, 520),
+            (float("inf"), 620),
+        ],
+        "cod_charge_pct": 2.0,   # 2% of order value
+        "cod_min": 50,
+        "excess_weight_per_kg": 52,
     },
+
     "Delhivery": {
-        "slabs": [(0.5,35),(1.0,55),(2.0,75),(5.0,105),(10.0,155),(float("inf"),195)],
-        "cod_charge_pct": 1.5, "excess_weight_per_kg": 16,
+        # ₹59 base + ₹20/kg approx from edesy comparison
+        "slabs": [
+            (0.5,  78),
+            (1.0,  100),
+            (2.0,  140),
+            (5.0,  230),
+            (10.0, 390),
+            (float("inf"), 470),
+        ],
+        "cod_charge_pct": 1.75,
+        "cod_min": 50,
+        "excess_weight_per_kg": 40,
     },
+
     "Ekart": {
-        "slabs": [(0.5,30),(1.0,50),(2.0,70),(5.0,95),(10.0,140),(float("inf"),175)],
-        "cod_charge_pct": 1.5, "excess_weight_per_kg": 14,
+        # Flipkart's courier — ₹52 base + ₹18/kg from edesy
+        "slabs": [
+            (0.5,  70),
+            (1.0,  90),
+            (2.0,  125),
+            (5.0,  200),
+            (10.0, 340),
+            (float("inf"), 410),
+        ],
+        "cod_charge_pct": 1.5,
+        "cod_min": 50,
+        "excess_weight_per_kg": 34,
     },
+
     "DTDC": {
-        "slabs": [(0.5,40),(1.0,60),(2.0,80),(5.0,110),(10.0,165),(float("inf"),205)],
-        "cod_charge_pct": 1.5, "excess_weight_per_kg": 15,
+        # Budget courier — ₹52 base + ₹16/kg from edesy
+        "slabs": [
+            (0.5,  68),
+            (1.0,  88),
+            (2.0,  120),
+            (5.0,  195),
+            (10.0, 325),
+            (float("inf"), 390),
+        ],
+        "cod_charge_pct": 1.5,
+        "cod_min": 50,
+        "excess_weight_per_kg": 32,
     },
+
+    "Xpressbees": {
+        # ₹49 base + ₹17/kg from edesy
+        "slabs": [
+            (0.5,  66),
+            (1.0,  85),
+            (2.0,  118),
+            (5.0,  190),
+            (10.0, 315),
+            (float("inf"), 380),
+        ],
+        "cod_charge_pct": 1.5,
+        "cod_min": 50,
+        "excess_weight_per_kg": 33,
+    },
+
+    "Shadowfax": {
+        # ₹46 base + ₹14/kg from edesy
+        "slabs": [
+            (0.5,  60),
+            (1.0,  78),
+            (2.0,  108),
+            (5.0,  175),
+            (10.0, 290),
+            (float("inf"), 350),
+        ],
+        "cod_charge_pct": 1.5,
+        "cod_min": 50,
+        "excess_weight_per_kg": 30,
+    },
+
+    "Ecom Express": {
+        # ₹55 base + ₹18/kg from edesy
+        "slabs": [
+            (0.5,  73),
+            (1.0,  94),
+            (2.0,  130),
+            (5.0,  210),
+            (10.0, 350),
+            (float("inf"), 420),
+        ],
+        "cod_charge_pct": 1.5,
+        "cod_min": 50,
+        "excess_weight_per_kg": 35,
+    },
+
     "Default": {
-        "slabs": [(0.5,40),(1.0,60),(2.0,80),(5.0,110),(10.0,160),(float("inf"),200)],
-        "cod_charge_pct": 1.5, "excess_weight_per_kg": 15,
+        "slabs": [
+            (0.5,  70),
+            (1.0,  90),
+            (2.0,  125),
+            (5.0,  200),
+            (10.0, 340),
+            (float("inf"), 410),
+        ],
+        "cod_charge_pct": 1.75,
+        "cod_min": 50,
+        "excess_weight_per_kg": 35,
     },
 }
-GST_RATE = 0.18
-COD_MIN_CHARGE = 30.0
 
-# ── OCR ───────────────────────────────────────────────────────────────────────
+# --------------------------------------------------
+# OCR
+# --------------------------------------------------
+
 def pdf_to_images(pdf_bytes):
-    return convert_from_bytes(pdf_bytes, dpi=200)
+    return convert_from_bytes(pdf_bytes, dpi=300)
 
 def ocr_image(image):
-    return pytesseract.image_to_string(image, config="--psm 6 --oem 3")
+    return pytesseract.image_to_string(image, config="--oem 3 --psm 4")
 
 def extract_text_from_pdf(pdf_bytes):
-    return "\n\n--- PAGE BREAK ---\n\n".join(ocr_image(img) for img in pdf_to_images(pdf_bytes))
+    pages = pdf_to_images(pdf_bytes)
+    return "\n\n".join(ocr_image(p) for p in pages)
 
 def extract_text_from_image(image_bytes):
-    return ocr_image(Image.open(io.BytesIO(image_bytes)))
+    img = Image.open(io.BytesIO(image_bytes))
+    return ocr_image(img)
 
-# ── LLM PARSING ───────────────────────────────────────────────────────────────
-EXTRACTION_PROMPT = """
-You are a logistics invoice data-extraction assistant.
-Extract the following fields from the raw OCR text and return ONLY a valid JSON object.
-If a field is not found, use null.
+# --------------------------------------------------
+# COURIER DETECTION
+# --------------------------------------------------
 
-Fields: invoice_number, invoice_date (YYYY-MM-DD), awb_number, courier_partner,
-shipment_weight (kg, number), payment_mode ("COD" or "Prepaid"),
-shipping_charge (INR excl GST, number), gst_amount (INR, number),
-total_amount (INR, number), order_value (INR, number or null).
+def normalize_courier(name):
+    if not name:
+        return "Default"
+    name = name.lower()
+    if "blue" in name or "bluedart" in name:
+        return "BlueDart"
+    if "delhivery" in name:
+        return "Delhivery"
+    if "ekart" in name:
+        return "Ekart"
+    if "dtdc" in name:
+        return "DTDC"
+    if "xpress" in name:
+        return "Xpressbees"
+    if "shadowfax" in name:
+        return "Shadowfax"
+    if "ecom" in name:
+        return "Ecom Express"
+    return "Default"
 
-Return ONLY the JSON object, no explanation, no markdown fences.
+# --------------------------------------------------
+# FIELD EXTRACTION
+# --------------------------------------------------
 
---- RAW OCR TEXT ---
-{ocr_text}
-"""
+def parse_invoice(text):
 
-def parse_invoice_with_llm(ocr_text, api_key):
-    client = anthropic.Anthropic(api_key=api_key)
-    message = client.messages.create(
-        model="claude-sonnet-4-20250514", max_tokens=1000,
-        messages=[{"role": "user", "content": EXTRACTION_PROMPT.format(ocr_text=ocr_text[:8000])}],
-    )
-    raw = re.sub(r"^```[a-z]*\n?", "", message.content[0].text.strip())
-    raw = re.sub(r"\n?```$", "", raw)
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        m = re.search(r"\{.*\}", raw, re.DOTALL)
-        if m:
-            return json.loads(m.group())
-        raise ValueError(f"LLM returned non-JSON:\n{raw}")
-
-def parse_invoice_regex_fallback(ocr_text):
-    def find(patterns, text, cast=None):
-        for pat in patterns:
-            m = re.search(pat, text, re.IGNORECASE)
+    def find(patterns, cast=None):
+        for p in patterns:
+            m = re.search(p, text, re.I)
             if m:
-                val = m.group(1).strip().replace(",", "")
-                return cast(val) if cast else val
+                val = m.group(1).replace(",", "").strip()
+                try:
+                    return cast(val) if cast else val
+                except (ValueError, TypeError):
+                    continue
         return None
 
-    t = ocr_text
+    # Detect courier
+    courier_raw = find([
+        r"(bluedart|blue\s*dart|delhivery|ekart|dtdc|xpressbees|shadowfax|ecom\s*express)"
+    ])
+
+    # ✅ FIX: Payment mode — COD check first, then Prepaid (avoids dual-match bug)
     payment_mode = None
-    if re.search(r"\bcod\b|\bcash\s*on\s*delivery\b", t, re.I):
+    if re.search(r"\bcod\b|cash\s*on\s*delivery", text, re.I):
         payment_mode = "COD"
-    elif re.search(r"\bprepaid\b|\bonline\b|\bpaid\b", t, re.I):
+    elif re.search(r"\bprepaid\b", text, re.I):
         payment_mode = "Prepaid"
 
-    courier = find([r"(bluedart|delhivery|ekart|dtdc|ecom express|xpressbees|shadowfax)"], t)
-
     return {
-        "invoice_number": find([r"invoice\s*(?:no|number|#)[:\s#]*([A-Z0-9\-/]+)", r"inv[.\s]*no[:\s]*([A-Z0-9\-/]+)"], t),
-        "invoice_date":   find([r"invoice\s*date[:\s]*(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})", r"date[:\s]*(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})"], t),
-        "awb_number":     find([r"awb\s*(?:no|number|#)[:\s#]*([A-Z0-9\-]+)", r"airway\s*bill[:\s]*([A-Z0-9\-]+)", r"tracking\s*(?:no|id)[:\s]*([A-Z0-9\-]+)"], t),
-        "courier_partner": (courier or "").title() or None,
-        "shipment_weight": find([r"(?:chargeable|charged|actual)\s*weight[:\s]*([\d.]+)\s*kg", r"weight[:\s]*([\d.]+)\s*kg"], t, cast=float),
-        "payment_mode":   payment_mode,
-        "shipping_charge": find([r"(?:shipping|freight|delivery)\s*charge[:\s]*([\d,.]+)", r"base\s*(?:price|charge)[:\s]*([\d,.]+)"], t, cast=float),
-        "gst_amount":     find([r"(?:gst|igst|cgst\s*\+\s*sgst)[:\s]*([\d,.]+)", r"tax[:\s]*([\d,.]+)"], t, cast=float),
-        "total_amount":   find([r"(?:grand\s*total|total\s*amount|net\s*payable)[:\s]*([\d,.]+)", r"total[:\s]*([\d,.]+)"], t, cast=float),
-        "order_value":    find([r"(?:order|declared|invoice)\s*value[:\s]*([\d,.]+)", r"cod\s*amount[:\s]*([\d,.]+)"], t, cast=float),
+        "invoice_number": find([
+            r"invoice\s*(?:no|number|#)[:\s]*([A-Z0-9\-\/]+)",
+            r"inv[.\s]*no[:\s]*([A-Z0-9\-\/]+)",
+        ]),
+        "invoice_date": find([
+            r"invoice\s*date[:\s]*(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})",
+            r"date[:\s]*(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})",
+        ]),
+        "awb_number": find([
+            r"awb\s*(?:no|number|id)?[:\s]*([A-Z0-9\-]{8,})",
+            r"tracking\s*(?:no|id)?[:\s]*([A-Z0-9\-]{8,})",
+            r"\b([0-9]{10,})\b",
+        ]),
+        "courier_partner": courier_raw,
+        "shipment_weight": find([
+            r"(?:chargeable|charged|actual)\s*weight[:\s]*([\d.]+)",
+            r"weight[:\s]*([\d.]+)",
+        ], float),
+        "payment_mode": payment_mode,
+        "shipping_charge": find([
+            r"(?:shipping|freight|delivery)\s*charge[:\s]*([\d.]+)",
+            r"base\s*(?:price|charge)[:\s]*([\d.]+)",
+        ], float),
+        "gst_amount": find([
+            r"(?:igst|cgst|sgst|gst)[:\s]*([\d.]+)",
+            r"tax[:\s]*([\d.]+)",
+        ], float),
+        "total_amount": find([
+            r"(?:grand\s*total|total\s*amount|net\s*payable)[:\s]*([\d.]+)",
+            r"total[:\s]*([\d.]+)",
+        ], float),
+        "order_value": find([
+            r"(?:order|declared|invoice)\s*value[:\s]*([\d.]+)",
+            r"cod\s*amount[:\s]*([\d.]+)",
+        ], float),
     }
 
-# ── AUDIT ENGINE ──────────────────────────────────────────────────────────────
-class AuditFinding:
-    ICONS = {"ERROR": "🔴", "WARNING": "🟡", "INFO": "🔵"}
-    def __init__(self, rule, severity, message, expected=None, actual=None, difference=None):
-        self.rule, self.severity, self.message = rule, severity, message
-        self.expected, self.actual, self.difference = expected, actual, difference
-    def to_dict(self):
-        return {"rule": self.rule, "severity": self.severity,
-                "icon": self.ICONS.get(self.severity, "⚪"), "message": self.message,
-                "expected": self.expected, "actual": self.actual, "difference": self.difference}
+# --------------------------------------------------
+# AUDIT ENGINE
+# --------------------------------------------------
 
 def get_rate_card(courier):
-    if courier:
-        for key in RATE_CARD:
-            if key.lower() in (courier or "").lower():
-                return RATE_CARD[key]
-    return RATE_CARD["Default"]
+    key = normalize_courier(courier)
+    return RATE_CARD.get(key, RATE_CARD["Default"])
 
-def expected_shipping_charge(weight_kg, card):
-    for slab_max, charge in card["slabs"]:
-        if weight_kg <= slab_max:
-            return float(charge)
-    return float(card["slabs"][-1][1])
+def expected_shipping(weight, card):
+    for slab, price in card["slabs"]:
+        if weight <= slab:
+            return price
+    return card["slabs"][-1][1]
 
-def audit_weight_slab(data, card):
-    w, c = data.get("shipment_weight"), data.get("shipping_charge")
-    if w is None or c is None:
-        return AuditFinding("Weight Slab", "INFO", "Cannot verify weight slab: weight or charge missing.")
-    exp = expected_shipping_charge(w, card)
-    diff = c - exp
-    if abs(diff) > 5.0:
-        return AuditFinding("Weight Slab Mismatch", "ERROR",
-            f"Shipping charge ₹{c:.2f} doesn't match rate card for {w} kg (expected ₹{exp:.2f}).",
-            expected=f"₹{exp:.2f}", actual=f"₹{c:.2f}", difference=f"₹{diff:+.2f}")
-    return None
-
-def audit_cod_on_prepaid(data, card):
-    if (data.get("payment_mode") or "").upper() != "PREPAID":
-        return None
-    total = data.get("total_amount") or 0
-    shipping = data.get("shipping_charge") or 0
-    gst = data.get("gst_amount") or 0
-    extras = total - shipping - gst
-    cod_est = max((data.get("order_value") or 1000) * card["cod_charge_pct"] / 100, COD_MIN_CHARGE)
-    if extras > cod_est * 0.5:
-        return AuditFinding("COD on Prepaid", "ERROR",
-            f"Potential COD charge (₹{extras:.2f}) detected on a Prepaid shipment.",
-            expected="₹0.00", actual=f"₹{extras:.2f}", difference=f"₹{extras:+.2f}")
-    return None
-
-def audit_duplicate_awb(data, seen_awbs):
-    awb = data.get("awb_number")
-    if not awb:
-        return AuditFinding("Duplicate AWB", "INFO", "AWB number not found; cannot check duplicates.")
-    if awb in seen_awbs:
-        return AuditFinding("Duplicate AWB", "ERROR",
-            f"AWB {awb} has already been billed in this audit session.",
-            expected="Unique AWB", actual=awb)
-    seen_awbs.add(awb)
-    return None
-
-def audit_gst(data):
-    s, g = data.get("shipping_charge"), data.get("gst_amount")
-    if s is None or g is None:
-        return AuditFinding("GST Calculation", "INFO", "Cannot verify GST: shipping charge or GST amount missing.")
-    exp = round(s * GST_RATE, 2)
-    diff = g - exp
-    if abs(diff) > 2.0:
-        return AuditFinding("GST Miscalculation", "ERROR",
-            f"GST ₹{g:.2f} doesn't match 18% of shipping charge ₹{s:.2f}.",
-            expected=f"₹{exp:.2f}", actual=f"₹{g:.2f}", difference=f"₹{diff:+.2f}")
-    return None
-
-def audit_excess_weight_charge(data, card):
-    w, tot, s, g = data.get("shipment_weight"), data.get("total_amount"), data.get("shipping_charge"), data.get("gst_amount")
-    if None in (w, tot, s, g):
-        return None
-    surplus = tot - s - g
-    per_kg = card["excess_weight_per_kg"]
-    if surplus > per_kg * 1.5:
-        return AuditFinding("Excess Weight Charge", "WARNING",
-            f"Extra charges ₹{surplus:.2f} exceed expected excess-weight rate (₹{per_kg}/kg).",
-            expected=f"≤ ₹{per_kg*1.5:.2f}", actual=f"₹{surplus:.2f}",
-            difference=f"₹{surplus - per_kg*1.5:+.2f}")
-    return None
-
-def run_audit(data, seen_awbs):
+def run_audit(data, seen_awb):
+    findings = []
     card = get_rate_card(data.get("courier_partner"))
-    findings = [f.to_dict() for f in [
-        audit_weight_slab(data, card),
-        audit_cod_on_prepaid(data, card),
-        audit_duplicate_awb(data, seen_awbs),
-        audit_gst(data),
-        audit_excess_weight_charge(data, card),
-    ] if f]
-    if not findings:
-        findings.append({"rule":"All Clear","severity":"INFO","icon":"✅",
-                         "message":"No billing anomalies detected.",
-                         "expected":None,"actual":None,"difference":None})
+
+    weight = data.get("shipment_weight")
+    charge = data.get("shipping_charge")
+    gst    = data.get("gst_amount")
+    total  = data.get("total_amount")
+    mode   = (data.get("payment_mode") or "").upper()
+    awb    = data.get("awb_number")
+    order_val = data.get("order_value")
+
+    # ── Rule 1: Weight slab mismatch ──────────────────────────────────────
+    if weight and charge:
+        expected = expected_shipping(weight, card)
+        diff = charge - expected
+        if abs(diff) > 10:  # ₹10 tolerance
+            findings.append({
+                "rule": "Weight Slab Mismatch",
+                "severity": "ERROR",
+                "message": f"Charged ₹{charge:.2f} but rate card says ₹{expected:.2f} for {weight} kg. Difference: ₹{diff:+.2f}",
+            })
+    else:
+        findings.append({
+            "rule": "Weight Slab",
+            "severity": "INFO",
+            "message": "Weight or shipping charge not found — cannot verify slab.",
+        })
+
+    # ── Rule 2: COD charge on Prepaid shipment ────────────────────────────
+    if mode == "PREPAID" and total and charge and gst:
+        implied_extras = total - charge - gst
+        cod_estimate = max(
+            (order_val or 1000) * card["cod_charge_pct"] / 100,
+            card["cod_min"]
+        )
+        if implied_extras > (cod_estimate * 0.5):
+            findings.append({
+                "rule": "COD Charge on Prepaid",
+                "severity": "ERROR",
+                "message": f"Shipment is Prepaid but extra charges of ₹{implied_extras:.2f} detected — possible incorrect COD fee.",
+            })
+
+    # ── Rule 3: Duplicate AWB ─────────────────────────────────────────────
+    if awb:
+        if awb in seen_awb:
+            findings.append({
+                "rule": "Duplicate AWB",
+                "severity": "ERROR",
+                "message": f"AWB {awb} has already been billed in this session — possible duplicate invoice.",
+            })
+        seen_awb.add(awb)
+    else:
+        findings.append({
+            "rule": "Duplicate AWB",
+            "severity": "INFO",
+            "message": "AWB number not found — cannot check for duplicates.",
+        })
+
+    # ── Rule 4: GST miscalculation ────────────────────────────────────────
+    if charge and gst:
+        expected_gst = round(charge * GST_RATE, 2)
+        diff = gst - expected_gst
+        if abs(diff) > 2:
+            findings.append({
+                "rule": "GST Miscalculation",
+                "severity": "ERROR",
+                "message": f"GST should be ₹{expected_gst:.2f} (18% of ₹{charge:.2f}) but ₹{gst:.2f} was charged. Diff: ₹{diff:+.2f}",
+            })
+    else:
+        findings.append({
+            "rule": "GST",
+            "severity": "INFO",
+            "message": "Shipping charge or GST amount missing — cannot verify.",
+        })
+
+    # ── Rule 5: Excess weight charge ──────────────────────────────────────
+    if total and charge and gst:
+        surplus = total - charge - gst
+        per_kg  = card["excess_weight_per_kg"]
+        if surplus > per_kg * 2:
+            findings.append({
+                "rule": "Excess Weight Charge",
+                "severity": "WARNING",
+                "message": f"Extra charges of ₹{surplus:.2f} exceed expected excess-weight rate of ₹{per_kg}/kg — verify with courier.",
+            })
+
     return findings
 
-# ── UI ────────────────────────────────────────────────────────────────────────
+# --------------------------------------------------
+# UI
+# --------------------------------------------------
+
 st.set_page_config(page_title="AI Invoice Auditor", page_icon="🧾", layout="wide")
 
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
-:root{--bg:#0d0f14;--surface:#161922;--surface2:#1e2330;--border:#2a3040;--accent:#4f8ef7;--accent2:#7c3aed;--success:#22c55e;--warning:#f59e0b;--error:#ef4444;--text:#e2e8f0;--muted:#64748b;}
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono&display=swap');
+:root{--bg:#0d0f14;--surface:#161922;--surface2:#1e2330;--border:#2a3040;
+      --accent:#4f8ef7;--accent2:#7c3aed;--success:#22c55e;
+      --warning:#f59e0b;--error:#ef4444;--text:#e2e8f0;--muted:#64748b;}
 html,body,[data-testid="stAppViewContainer"]{background:var(--bg)!important;color:var(--text)!important;font-family:'Space Grotesk',sans-serif!important;}
 [data-testid="stSidebar"]{background:var(--surface)!important;border-right:1px solid var(--border);}
 .block-container{padding-top:1.5rem!important;}
 .stFileUploader>div{background:var(--surface2)!important;border:1.5px dashed var(--border)!important;border-radius:12px!important;}
 .stButton>button{background:linear-gradient(135deg,var(--accent),var(--accent2))!important;color:#fff!important;border:none!important;border-radius:8px!important;font-weight:600!important;padding:.5rem 1.4rem!important;}
-.card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:1.2rem 1.4rem;margin-bottom:1rem;}
-.finding-error{border-left:4px solid var(--error)!important;}
-.finding-warning{border-left:4px solid var(--warning)!important;}
-.finding-info{border-left:4px solid var(--accent)!important;}
-.finding-ok{border-left:4px solid var(--success)!important;}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:1.1rem 1.3rem;margin-bottom:.8rem;}
+.fe{border-left:4px solid var(--error)!important;}
+.fw{border-left:4px solid var(--warning)!important;}
+.fi{border-left:4px solid var(--accent)!important;}
+.fok{border-left:4px solid var(--success)!important;}
 .badge{display:inline-block;padding:2px 10px;border-radius:999px;font-size:.72rem;font-weight:600;text-transform:uppercase;}
-.badge-error{background:#7f1d1d;color:#fca5a5;}
-.badge-warning{background:#78350f;color:#fcd34d;}
-.badge-info{background:#1e3a5f;color:#93c5fd;}
-.badge-ok{background:#14532d;color:#86efac;}
-.metric-box{background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:.9rem 1rem;text-align:center;}
-.metric-value{font-size:1.6rem;font-weight:700;font-family:'JetBrains Mono',monospace;}
-.metric-label{font-size:.75rem;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-top:2px;}
-.ocr-box{background:#0a0c10;border:1px solid var(--border);border-radius:10px;padding:1rem;font-family:'JetBrains Mono',monospace;font-size:.75rem;color:#94a3b8;max-height:260px;overflow-y:auto;white-space:pre-wrap;}
-.json-box{background:#0a0c10;border:1px solid var(--border);border-radius:10px;padding:1rem;font-family:'JetBrains Mono',monospace;font-size:.78rem;color:#7dd3fc;max-height:340px;overflow-y:auto;white-space:pre;}
+.be{background:#7f1d1d;color:#fca5a5;}
+.bw{background:#78350f;color:#fcd34d;}
+.bi{background:#1e3a5f;color:#93c5fd;}
+.bok{background:#14532d;color:#86efac;}
+.mbox{background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:.9rem 1rem;text-align:center;}
+.mv{font-size:1.5rem;font-weight:700;font-family:'JetBrains Mono',monospace;}
+.ml{font-size:.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-top:3px;}
+.note{background:#1a1f2e;border:1px solid #2a3040;border-radius:8px;padding:.7rem 1rem;font-size:.78rem;color:#64748b;margin-top:1rem;}
 </style>
 """, unsafe_allow_html=True)
 
-if "seen_awbs" not in st.session_state:
-    st.session_state.seen_awbs = set()
-if "audit_history" not in st.session_state:
-    st.session_state.audit_history = []
+# Session state
+if "seen_awb" not in st.session_state:
+    st.session_state.seen_awb = set()
+if "history" not in st.session_state:
+    st.session_state.history = []
 
 # Sidebar
 with st.sidebar:
     st.markdown("## ⚙️ Configuration")
-    api_key = st.text_input("Anthropic API Key", type="password", placeholder="sk-ant-...",
-        help="Leave blank to use regex fallback.")
     st.markdown("---")
     st.markdown("### 📋 Rate Card Preview")
+    st.markdown(
+        "<div class='note'>ℹ️ Rates shown are indicative national-zone estimates "
+        "based on 2025 Shiprocket market data. Actual rates depend on your "
+        "contract, zone, and volume.</div>",
+        unsafe_allow_html=True
+    )
     cp = st.selectbox("Courier", list(RATE_CARD.keys()))
     cpcard = RATE_CARD[cp]
-    slab_rows = "".join(f"<tr><td>≤ {s[0]} kg</td><td>₹{s[1]}</td></tr>" for s in cpcard["slabs"])
-    st.markdown(f"<table style='width:100%;font-size:.8rem;color:#94a3b8'><thead><tr><th>Slab</th><th>Rate</th></tr></thead><tbody>{slab_rows}</tbody></table>", unsafe_allow_html=True)
-    st.markdown(f"COD %: **{cpcard['cod_charge_pct']}%** | Excess/kg: **₹{cpcard['excess_weight_per_kg']}**")
+    rows = "".join(
+        f"<tr><td style='padding:4px 8px'>≤ {s[0]} kg</td><td style='padding:4px 8px'>₹{s[1]}</td></tr>"
+        for s in cpcard["slabs"]
+    )
+    st.markdown(
+        f"<table style='width:100%;font-size:.82rem;color:#94a3b8;border-collapse:collapse'>"
+        f"<thead><tr><th style='text-align:left;padding:4px 8px;border-bottom:1px solid #2a3040'>Slab</th>"
+        f"<th style='text-align:left;padding:4px 8px;border-bottom:1px solid #2a3040'>Rate</th></tr></thead>"
+        f"<tbody>{rows}</tbody></table>",
+        unsafe_allow_html=True
+    )
+    st.markdown(
+        f"COD: **{cpcard['cod_charge_pct']}%** (min ₹{cpcard['cod_min']}) | "
+        f"Excess/kg: **₹{cpcard['excess_weight_per_kg']}**"
+    )
     st.markdown("---")
     if st.button("🗑️ Reset Session"):
-        st.session_state.seen_awbs = set()
-        st.session_state.audit_history = []
+        st.session_state.seen_awb = set()
+        st.session_state.history  = []
         st.success("Session cleared.")
 
 # Header
@@ -285,81 +439,58 @@ st.markdown("""
 <div style='display:flex;align-items:center;gap:1rem;margin-bottom:1.5rem'>
   <div style='font-size:2.8rem'>🧾</div>
   <div>
-    <h1 style='margin:0;font-size:2rem;background:linear-gradient(90deg,#4f8ef7,#7c3aed);-webkit-background-clip:text;-webkit-text-fill-color:transparent'>AI Invoice Auditor</h1>
+    <h1 style='margin:0;font-size:2rem;background:linear-gradient(90deg,#4f8ef7,#7c3aed);
+    -webkit-background-clip:text;-webkit-text-fill-color:transparent'>AI Invoice Auditor</h1>
     <p style='margin:0;color:#64748b;font-size:.9rem'>Shiprocket Logistics · Automated Billing Anomaly Detection</p>
   </div>
 </div>""", unsafe_allow_html=True)
 
 # Upload
-col_up1, col_up2 = st.columns(2)
-with col_up1:
+c1, c2 = st.columns(2)
+with c1:
     invoice_file = st.file_uploader("📄 Upload Invoice PDF", type=["pdf"])
-with col_up2:
+with c2:
     label_file = st.file_uploader("🏷️ Upload Shipment Label (optional)", type=["pdf","png","jpg","jpeg"])
 
-if not OCR_AVAILABLE:
-    st.error("OCR libraries not available. Install: `pip install pytesseract pillow pdf2image`")
+run_btn = st.button("🔍 Run Audit", disabled=invoice_file is None)
 
-run_audit_btn = st.button("🔍 Run Audit", disabled=(invoice_file is None or not OCR_AVAILABLE))
+# ── ALL pipeline + results inside this block ──────────────────────────────────
+if run_btn and invoice_file:
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ALL pipeline + results logic lives INSIDE this single if-block.
-# This is the fix: nothing below references `findings` or `invoice_data`
-# outside of this guarded scope.
-# ═══════════════════════════════════════════════════════════════════════════════
-if run_audit_btn and invoice_file:
+    with st.spinner("Running OCR and audit…"):
 
-    with st.spinner("Running audit pipeline…"):
-        st.markdown("---")
-        st.markdown("### 🔬 Audit Pipeline")
-        progress = st.progress(0, text="Step 1 / 5 — Reading file…")
+        # OCR
+        pdf_bytes = invoice_file.read()
+        file_hash = hashlib.md5(pdf_bytes).hexdigest()[:8].upper()
 
-        invoice_bytes = invoice_file.read()
-        file_hash = hashlib.md5(invoice_bytes).hexdigest()[:8].upper()
-
-        progress.progress(20, text="Step 2 / 5 — Extracting text via OCR…")
         try:
-            ocr_text = (extract_text_from_pdf(invoice_bytes)
-                        if invoice_file.type == "application/pdf"
-                        else extract_text_from_image(invoice_bytes))
+            ocr_text = extract_text_from_pdf(pdf_bytes)
         except Exception as e:
             st.error(f"OCR failed: {e}")
             st.stop()
 
+        # Optional label
         if label_file:
-            label_bytes = label_file.read()
             try:
-                label_ocr = (extract_text_from_pdf(label_bytes)
+                lb = label_file.read()
+                label_ocr = (extract_text_from_pdf(lb)
                              if label_file.type == "application/pdf"
-                             else extract_text_from_image(label_bytes))
+                             else extract_text_from_image(lb))
                 if label_ocr:
                     ocr_text += "\n\n--- LABEL ---\n\n" + label_ocr
             except Exception:
                 pass
 
-        progress.progress(40, text="Step 3 / 5 — Parsing invoice fields…")
-        use_llm = bool(api_key and ANTHROPIC_AVAILABLE)
-        parse_method = "Claude (LLM)" if use_llm else "Regex Fallback"
-        try:
-            invoice_data = (parse_invoice_with_llm(ocr_text, api_key)
-                            if use_llm else parse_invoice_regex_fallback(ocr_text))
-        except Exception as e:
-            st.warning(f"LLM parse failed ({e}), falling back to regex.")
-            invoice_data = parse_invoice_regex_fallback(ocr_text)
-            parse_method = "Regex Fallback (LLM error)"
+        # Parse + audit
+        data     = parse_invoice(ocr_text)
+        findings = run_audit(data, st.session_state.seen_awb)
 
-        progress.progress(60, text="Step 4 / 5 — Structuring data…")
-        invoice_data["_meta"] = {
-            "file_name": invoice_file.name, "file_hash": file_hash,
-            "parse_method": parse_method,
+        data["_meta"] = {
+            "file": invoice_file.name,
+            "hash": file_hash,
             "audited_at": datetime.now().isoformat(timespec="seconds"),
         }
-
-        progress.progress(80, text="Step 5 / 5 — Running audit rules…")
-        findings = run_audit(invoice_data, st.session_state.seen_awbs)
-
-        progress.progress(100, text="✅ Audit complete.")
-        st.session_state.audit_history.append({"data": invoice_data, "findings": findings})
+        st.session_state.history.append({"data": data, "findings": findings})
 
     # ── Report ────────────────────────────────────────────────────────────
     st.markdown("---")
@@ -368,33 +499,32 @@ if run_audit_btn and invoice_file:
     errors   = sum(1 for f in findings if f["severity"] == "ERROR")
     warnings = sum(1 for f in findings if f["severity"] == "WARNING")
     status   = "FAIL" if errors else ("REVIEW" if warnings else "PASS")
-    status_color = "#ef4444" if errors else ("#f59e0b" if warnings else "#22c55e")
+    s_color  = "#ef4444" if errors else ("#f59e0b" if warnings else "#22c55e")
 
-    total_overcharge = 0.0
+    overcharge = 0.0
     for f in findings:
-        if f.get("difference"):
+        m = re.search(r"Diff(?:erence)?:\s*₹([+\-]?[\d.]+)", f["message"])
+        if m:
             try:
-                v = float(str(f["difference"]).replace("₹","").replace("+",""))
+                v = float(m.group(1).replace("+",""))
                 if v > 0:
-                    total_overcharge += v
-            except (ValueError, TypeError):
+                    overcharge += v
+            except ValueError:
                 pass
 
-    # Metrics
     cols = st.columns(6)
     for col, (val, label, color) in zip(cols, [
-        (status,                                            "Audit Status",        status_color),
-        (str(errors),                                       "Errors",              "#ef4444"),
-        (str(warnings),                                     "Warnings",            "#f59e0b"),
-        (f"₹{invoice_data.get('total_amount') or 0:,.2f}", "Total Billed",        "#4f8ef7"),
-        (f"₹{total_overcharge:,.2f}",                      "Overcharge Detected", "#ef4444"),
-        (invoice_data.get("awb_number") or "—",            "AWB Number",          "#7c3aed"),
+        (status,                                             "Audit Status",        s_color),
+        (str(errors),                                        "Errors",              "#ef4444"),
+        (str(warnings),                                      "Warnings",            "#f59e0b"),
+        (f"₹{data.get('total_amount') or 0:,.2f}",          "Total Billed",        "#4f8ef7"),
+        (f"₹{overcharge:,.2f}",                             "Overcharge Detected", "#ef4444"),
+        (data.get("awb_number") or "—",                     "AWB Number",          "#7c3aed"),
     ]):
         with col:
             st.markdown(
-                f"<div class='metric-box'>"
-                f"<div class='metric-value' style='color:{color}'>{val}</div>"
-                f"<div class='metric-label'>{label}</div></div>",
+                f"<div class='mbox'><div class='mv' style='color:{color}'>{val}</div>"
+                f"<div class='ml'>{label}</div></div>",
                 unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
@@ -404,75 +534,90 @@ if run_audit_btn and invoice_file:
     # Extracted fields
     with col_l:
         st.markdown("### 🗂️ Extracted Invoice Fields")
-        field_icons = {
+        icons = {
             "invoice_number":"🔢","invoice_date":"📅","awb_number":"📦",
             "courier_partner":"🚚","shipment_weight":"⚖️","payment_mode":"💳",
             "shipping_charge":"💰","gst_amount":"🧾","total_amount":"💵","order_value":"🛍️",
         }
-        for field, value in {k:v for k,v in invoice_data.items() if not k.startswith("_") and v is not None}.items():
-            icon = field_icons.get(field, "•")
-            label = field.replace("_"," ").title()
+        for field, value in {k: v for k, v in data.items() if not k.startswith("_") and v is not None}.items():
+            icon  = icons.get(field, "•")
+            label = field.replace("_", " ").title()
             if isinstance(value, float):
-                disp = (f"₹{value:,.2f}" if any(x in field for x in ("amount","charge","value")) else f"{value} kg")
+                disp = (f"₹{value:,.2f}"
+                        if any(x in field for x in ("amount","charge","value"))
+                        else f"{value} kg")
             else:
                 disp = str(value)
             st.markdown(
-                f"<div class='card' style='padding:.7rem 1rem;margin-bottom:.5rem;"
+                f"<div class='card' style='padding:.6rem 1rem;margin-bottom:.5rem;"
                 f"display:flex;justify-content:space-between;align-items:center'>"
                 f"<span style='color:#94a3b8;font-size:.85rem'>{icon} {label}</span>"
-                f"<span style='font-weight:600;font-family:JetBrains Mono,monospace;color:#e2e8f0'>{disp}</span></div>",
+                f"<span style='font-weight:600;font-family:JetBrains Mono,monospace;"
+                f"color:#e2e8f0'>{disp}</span></div>",
                 unsafe_allow_html=True)
 
-    # Audit findings
+    # Findings
     with col_r:
         st.markdown("### 🚨 Audit Findings")
+        sev_icon = {"ERROR":"🔴","WARNING":"🟡","INFO":"🔵"}
         for f in findings:
-            sev = f["severity"].lower()
-            badge_cls = f"badge-{sev}" if sev in ("error","warning","info") else "badge-ok"
-            find_cls  = (f"finding-{sev}" if sev in ("error","warning")
-                         else ("finding-ok" if f["rule"]=="All Clear" else "finding-info"))
-            extras = ""
-            if f.get("expected"):
-                extras = (f"<br><small style='color:#94a3b8'>Expected: <b>{f['expected']}</b>"
-                          f" · Actual: <b>{f['actual']}</b>")
-                if f.get("difference"):
-                    extras += f" · Diff: <b>{f['difference']}</b>"
-                extras += "</small>"
+            sev = f["severity"]
+            fc  = {"ERROR":"fe","WARNING":"fw","INFO":"fi"}.get(sev,"fok")
+            bc  = {"ERROR":"be","WARNING":"bw","INFO":"bi"}.get(sev,"bok")
             st.markdown(
-                f"<div class='card {find_cls}'>"
-                f"<div style='display:flex;justify-content:space-between;align-items:flex-start'>"
-                f"<span style='font-weight:600'>{f['icon']} {f['rule']}</span>"
-                f"<span class='badge {badge_cls}'>{f['severity']}</span></div>"
-                f"<p style='margin:.4rem 0 0;font-size:.87rem;color:#cbd5e1'>{f['message']}{extras}</p></div>",
+                f"<div class='card {fc}'>"
+                f"<div style='display:flex;justify-content:space-between;align-items:center'>"
+                f"<span style='font-weight:600'>{sev_icon.get(sev,'✅')} {f['rule']}</span>"
+                f"<span class='badge {bc}'>{sev}</span></div>"
+                f"<p style='margin:.4rem 0 0;font-size:.85rem;color:#cbd5e1'>{f['message']}</p>"
+                f"</div>",
                 unsafe_allow_html=True)
 
-    with st.expander("🔍 OCR Text", expanded=False):
-        st.markdown(f"<div class='ocr-box'>{ocr_text[:4000]}</div>", unsafe_allow_html=True)
+    # Rate card note
+    st.markdown(
+        "<div class='note'>⚠️ <b>Rate Card Note:</b> Rates used for audit are indicative "
+        "2025 national-zone estimates via Shiprocket. Your actual contracted rates may differ. "
+        "Always cross-check findings against your courier service agreement.</div>",
+        unsafe_allow_html=True)
 
-    with st.expander("📦 Structured JSON", expanded=False):
-        st.markdown(f"<div class='json-box'>{json.dumps(invoice_data, indent=2)}</div>", unsafe_allow_html=True)
+    # Expandables
+    with st.expander("🔍 Raw OCR Text"):
+        st.text(ocr_text[:4000])
 
-    report = {"invoice": invoice_data, "findings": findings,
-              "summary": {"status": status, "errors": errors,
-                          "warnings": warnings, "total_overcharge": total_overcharge}}
-    st.download_button("⬇️ Download Audit Report (JSON)",
+    with st.expander("📦 Structured JSON"):
+        st.json({k: v for k, v in data.items() if not k.startswith("_")})
+
+    # Download
+    report = {
+        "invoice": {k: v for k, v in data.items() if not k.startswith("_")},
+        "findings": findings,
+        "summary": {"status": status, "errors": errors,
+                    "warnings": warnings, "overcharge_detected": overcharge},
+    }
+    st.download_button(
+        "⬇️ Download Audit Report (JSON)",
         data=json.dumps(report, indent=2),
         file_name=f"audit_{file_hash}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-        mime="application/json")
+        mime="application/json",
+    )
 
-# Session history — safe: only shown when history exists, no unguarded variables
-if st.session_state.audit_history:
+# Session history
+if st.session_state.history:
     st.markdown("---")
-    st.markdown("## 📜 Session Audit History")
-    for i, entry in enumerate(reversed(st.session_state.audit_history), 1):
+    st.markdown("## 📜 Session History")
+    for i, entry in enumerate(reversed(st.session_state.history), 1):
         d, fs = entry["data"], entry["findings"]
         errs  = sum(1 for f in fs if f["severity"] == "ERROR")
         warns = sum(1 for f in fs if f["severity"] == "WARNING")
         icon  = "🔴" if errs else ("🟡" if warns else "✅")
-        with st.expander(f"{icon} #{i} — {d.get('invoice_number','N/A')} | AWB: {d.get('awb_number','N/A')} | {d['_meta']['audited_at']}"):
+        with st.expander(
+            f"{icon} #{i} — {d.get('invoice_number','N/A')} | "
+            f"AWB: {d.get('awb_number','N/A')} | {d['_meta']['audited_at']}"
+        ):
             c1, c2 = st.columns(2)
             with c1:
                 st.json({k: v for k, v in d.items() if not k.startswith("_")})
             with c2:
+                sev_icon = {"ERROR":"🔴","WARNING":"🟡","INFO":"🔵"}
                 for f in fs:
-                    st.markdown(f"{f['icon']} **{f['rule']}** — {f['message']}")
+                    st.markdown(f"{sev_icon.get(f['severity'],'✅')} **{f['rule']}** — {f['message']}")
