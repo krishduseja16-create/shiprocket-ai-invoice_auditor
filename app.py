@@ -1,11 +1,11 @@
 """
-AI Invoice Auditor — Mosaic Wellness Fellowship Submission
+Invoice Auditor — Mosaic Wellness Fellowship Submission
 Krish Duseja | BBA Finance, Christ University
 """
 
 import streamlit as st
 import json, re, io, hashlib
-from datetime import datetime
+from datetime import datetime, date
 from typing import Optional
 
 try:
@@ -22,11 +22,16 @@ try:
 except ImportError:
     ANTHROPIC_AVAILABLE = False
 
+try:
+    import plotly.graph_objects as go
+    PLOTLY = True
+except ImportError:
+    PLOTLY = False
+
 # ─────────────────────────────────────────────────────────────────────────────
-# REAL RATE CARD — Sourced from Shiprocket's published rate sheet (2024-25)
+# REAL RATE CARD — Shiprocket published rate sheet 2024-25
 # Plans: Lite (₹0/mo), Basic (₹1000/mo), Advanced (₹2000/mo)
 # Zones: Within City | Within State | Metro-Metro | Rest of India | NE & J&K
-# All rates are for 0.5 kg base slab, Air mode
 # ─────────────────────────────────────────────────────────────────────────────
 SHIPROCKET_RATES = {
     "BlueDart": {
@@ -56,23 +61,10 @@ SHIPROCKET_RATES = {
     },
 }
 
-ZONE_NAMES = ["Within City", "Within State", "Metro-Metro", "Rest of India", "NE & J&K"]
-
-# SAC code used by Shiprocket on all freight invoices
+ZONE_NAMES    = ["Within City", "Within State", "Metro-Metro", "Rest of India", "NE & J&K"]
 SHIPROCKET_SAC = "996812"
-SHIPROCKET_GST = 0.18   # 18% IGST on freight services
-
-# Real Shiprocket charge types from their billing documentation
-CHARGE_TYPES = {
-    "freight": "Base cost for shipping an order",
-    "excess_weight": "Charge for weight difference exceeding declared amount",
-    "rto_freight": "Cost of returning an undelivered shipment",
-    "cod_charge": "Fee for Cash on Delivery orders (1.5–2.5% of order value)",
-    "cod_reversed": "Reversal of COD charge for undelivered COD orders",
-    "rto_excess_weight": "Excess weight charge for returned shipments",
-    "shiprocket_credit": "Credit issued by Shiprocket for service errors",
-    "cancelled": "Credit for cancelled orders or shipments",
-}
+SHIPROCKET_GST = 0.18
+DISPUTE_WINDOW_DAYS = 7   # Shiprocket's official dispute window
 
 # ─────────────────────────────────────────────────────────────────────────────
 # OCR
@@ -90,7 +82,7 @@ def extract_text_from_image(image_bytes):
     return ocr_image(Image.open(io.BytesIO(image_bytes)))
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LLM EXTRACTION — Claude API
+# LLM EXTRACTION
 # ─────────────────────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """You are an expert at extracting structured data from Indian logistics invoices.
 You understand Shiprocket invoice formats, SAC codes, IGST/CGST/SGST breakdowns, and D2C billing structures.
@@ -99,41 +91,18 @@ Always return valid JSON only — no explanation, no markdown fences."""
 EXTRACTION_PROMPT = """Extract ALL fields from this invoice. Return ONLY a JSON object.
 
 Required fields:
-- invoice_number: string (e.g. "SRF2324/00503816")
-- invoice_date: string (YYYY-MM-DD)
-- due_date: string (YYYY-MM-DD or null)  
-- vendor_name: string (who issued the invoice — e.g. "BigFoot Retail Solutions Pvt Ltd")
-- client_name: string (who the invoice is billed to)
-- client_gstin: string or null
-- sac_code: string (e.g. "996812")
-- awb_number: string or null (air waybill / tracking number)
-- courier_partner: string (BlueDart, Delhivery, Xpressbees, Ecom Express, DotZot, etc.)
-- shipment_weight_declared: number in kg or null
-- shipment_weight_charged: number in kg or null  
-- payment_mode: "COD" or "Prepaid" or null
-- zone: string (Within City / Within State / Metro-Metro / Rest of India / NE & J&K) or null
-- freight_charge: number in INR (base freight before tax) or null
-- excess_weight_charge: number in INR or null
-- rto_charge: number in INR or null
-- cod_charge: number in INR or null
-- other_charges: number in INR or null
-- igst_rate: number (e.g. 18 for 18%) or null
-- igst_amount: number in INR or null
-- cgst_amount: number in INR or null
-- sgst_amount: number in INR or null
-- total_gst: number in INR (sum of all tax) or null
-- subtotal: number in INR (before tax) or null
-- grand_total: number in INR (including tax) or null
-- amount_due: number in INR or null
-- order_value: number in INR (for COD validation) or null
-- hsn_codes: list of strings found in invoice or []
-- mystery_line_items: list of strings (any line item descriptions not matching standard charge types) or []
-- invoice_status: "PAID" or "UNPAID" or "REVERSED" or null
-- state_of_supply: string or null
-- reverse_charge: boolean or null
+- invoice_number, invoice_date (YYYY-MM-DD), due_date (YYYY-MM-DD or null)
+- vendor_name, client_name, client_gstin
+- sac_code, awb_number, courier_partner
+- shipment_weight_declared (kg), shipment_weight_charged (kg)
+- payment_mode ("COD" or "Prepaid"), zone, state_of_supply
+- freight_charge, excess_weight_charge, rto_charge, cod_charge, other_charges
+- igst_rate (number), igst_amount, cgst_amount, sgst_amount, total_gst
+- subtotal, grand_total, amount_due, order_value
+- hsn_codes (list), mystery_line_items (list of unrecognised line item descriptions)
+- invoice_status ("PAID"/"UNPAID"/"REVERSED"), reverse_charge (boolean)
 
 Return ONLY the JSON object.
-
 --- INVOICE TEXT ---
 {text}"""
 
@@ -157,7 +126,6 @@ def parse_with_llm(text: str, api_key: str) -> dict:
         raise ValueError(f"LLM returned non-JSON:\n{raw[:500]}")
 
 def parse_regex_fallback(text: str) -> dict:
-    """Fallback when no API key."""
     def find(patterns, cast=None):
         for p in patterns:
             m = re.search(p, text, re.I | re.M)
@@ -178,26 +146,26 @@ def parse_regex_fallback(text: str) -> dict:
     courier = find([r"(bluedart|blue\s*dart|delhivery|xpressbees|ecom\s*express|dotzot|ekart|dtdc|shadowfax)"])
 
     return {
-        "invoice_number": find([r"invoice\s*(?:no|number|#)[.:\s]*([A-Z0-9\/\-]+)", r"inv\s*no[.:\s]*([A-Z0-9\/\-]+)"]),
-        "invoice_date":   find([r"invoice\s*date[:\s]*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})", r"date[:\s]*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})"]),
+        "invoice_number": find([r"invoice\s*(?:no|number|#)[.:\s]*([A-Z0-9\/\-]+)"]),
+        "invoice_date":   find([r"invoice\s*date[:\s]*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})"]),
         "due_date":       find([r"due\s*date[:\s]*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})"]),
         "vendor_name":    find([r"(bigfoot retail|shiprocket)"]),
-        "client_name":    find([r"invoice\s*to[:\s]*\n?([A-Za-z\s]+(?:pvt|ltd|llp|inc)?)", r"sold\s*by[:\s]*([A-Za-z\s]+)"]),
-        "client_gstin":   find([r"gstin[:\s]*([0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1})"]),
+        "client_name":    find([r"invoice\s*to[:\s]*\n?([A-Za-z\s]+(?:pvt|ltd)?)"]),
+        "client_gstin":   find([r"gstin[:\s]*([0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z])"]),
         "sac_code":       find([r"sac\s*(?:no|code)?[.:\s]*(\d{6})", r"\b(996812)\b"]),
         "awb_number":     find([r"awb\s*(?:no|number)?[.:\s]*([A-Z0-9]{8,})", r"\b(\d{12,})\b"]),
         "courier_partner": (courier or "").title() if courier else None,
-        "shipment_weight_declared": find([r"declared\s*weight[:\s]*([\d.]+)", r"weight[:\s]*([\d.]+)\s*kg"], float),
-        "shipment_weight_charged":  find([r"chargeable\s*weight[:\s]*([\d.]+)", r"charged\s*weight[:\s]*([\d.]+)"], float),
+        "shipment_weight_declared": find([r"declared\s*weight[:\s]*([\d.]+)"], float),
+        "shipment_weight_charged":  find([r"chargeable\s*weight[:\s]*([\d.]+)"], float),
         "payment_mode":   payment_mode,
         "zone":           find([r"(within\s*city|within\s*state|metro.to.metro|rest\s*of\s*india|north\s*east)"]),
-        "freight_charge": find([r"(?:shiprocket\s*v2?\s*)?freight[^₹\d]*([\d,]+\.?\d*)", r"freight\s*charge[:\s]*([\d,]+\.?\d*)"], float),
+        "freight_charge": find([r"(?:shiprocket\s*v2?\s*)?freight[^₹\d]*([\d,]+\.?\d*)"], float),
         "excess_weight_charge": find([r"excess\s*weight[:\s]*([\d,]+\.?\d*)"], float),
         "rto_charge":     find([r"rto[:\s]*([\d,]+\.?\d*)"], float),
         "cod_charge":     find([r"cod\s*charge[:\s]*([\d,]+\.?\d*)"], float),
         "other_charges":  None,
-        "igst_rate":      find([r"(\d+(?:\.\d+)?)\s*%\s*igst", r"igst\s*@?\s*(\d+(?:\.\d+)?)"], float),
-        "igst_amount":    find([r"igst[^₹\d]*([\d,]+\.?\d*)", r"18\.00%\s*igst[^₹\d]*([\d,]+\.?\d*)"], float),
+        "igst_rate":      find([r"(\d+(?:\.\d+)?)\s*%\s*igst"], float),
+        "igst_amount":    find([r"igst[^₹\d]*([\d,]+\.?\d*)"], float),
         "cgst_amount":    find([r"cgst[^₹\d]*([\d,]+\.?\d*)"], float),
         "sgst_amount":    find([r"sgst[^₹\d]*([\d,]+\.?\d*)"], float),
         "total_gst":      None,
@@ -213,10 +181,9 @@ def parse_regex_fallback(text: str) -> dict:
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# AUDIT ENGINE — 8 rules based on real Shiprocket billing logic
+# AUDIT ENGINE — 8 rules + dispute window + actionability
 # ─────────────────────────────────────────────────────────────────────────────
 def get_rate(courier, plan, zone_idx):
-    """Look up real Shiprocket rate for courier/plan/zone."""
     c_key = None
     for k in SHIPROCKET_RATES:
         if k.lower() in (courier or "").lower():
@@ -233,143 +200,243 @@ def detect_zone_idx(zone_str):
     if not zone_str:
         return None
     z = zone_str.lower()
-    if "city" in z:      return 0
-    if "state" in z:     return 1
-    if "metro" in z:     return 2
-    if "rest" in z:      return 3
+    if "city" in z:  return 0
+    if "state" in z: return 1
+    if "metro" in z: return 2
+    if "rest" in z:  return 3
     if "north" in z or "ne" in z or "j&k" in z: return 4
     return None
+
+def days_since_invoice(invoice_date_str):
+    """Return days elapsed since invoice date, or None if unparseable."""
+    if not invoice_date_str:
+        return None
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d/%m/%y"):
+        try:
+            inv_date = datetime.strptime(str(invoice_date_str), fmt).date()
+            return (date.today() - inv_date).days
+        except ValueError:
+            continue
+    return None
+
+def dispute_urgency(invoice_date_str):
+    """Returns (label, color, days_left) based on Shiprocket's 7-day dispute window."""
+    days = days_since_invoice(invoice_date_str)
+    if days is None:
+        return "Unknown", "#64748b", None
+    days_left = DISPUTE_WINDOW_DAYS - days
+    if days_left > 3:
+        return f"Dispute within {days_left} days", "#16a34a", days_left
+    elif days_left > 0:
+        return f"URGENT — {days_left} days left", "#d97706", days_left
+    else:
+        return f"Window closed ({abs(days_left)}d ago)", "#dc2626", 0
 
 def run_audit(data: dict, seen_invoices: set, seen_awbs: set, plan: str) -> list:
     findings = []
 
-    def add(rule, severity, msg, expected=None, actual=None, diff=None):
+    def add(rule, severity, msg, expected=None, actual=None, diff=None, actionable=True):
         findings.append({
             "rule": rule, "severity": severity, "message": msg,
             "expected": expected, "actual": actual, "difference": diff,
+            "actionable": actionable,
         })
 
-    courier  = data.get("courier_partner")
-    freight  = data.get("freight_charge")
-    gst      = data.get("total_gst") or data.get("igst_amount")
-    total    = data.get("grand_total")
-    subtotal = data.get("subtotal") or data.get("freight_charge")
-    mode     = (data.get("payment_mode") or "").upper()
-    awb      = data.get("awb_number")
-    inv_no   = data.get("invoice_number")
-    sac      = data.get("sac_code")
-    igst_rate = data.get("igst_rate")
-    order_val = data.get("order_value")
-    excess    = data.get("excess_weight_charge")
-    mystery   = data.get("mystery_line_items") or []
+    courier    = data.get("courier_partner")
+    freight    = data.get("freight_charge")
+    gst        = data.get("total_gst") or data.get("igst_amount")
+    total      = data.get("grand_total")
+    subtotal   = data.get("subtotal") or data.get("freight_charge")
+    mode       = (data.get("payment_mode") or "").upper()
+    awb        = data.get("awb_number")
+    inv_no     = data.get("invoice_number")
+    inv_date   = data.get("invoice_date")
+    sac        = data.get("sac_code")
+    igst_rate  = data.get("igst_rate")
+    excess     = data.get("excess_weight_charge")
+    mystery    = data.get("mystery_line_items") or []
     w_declared = data.get("shipment_weight_declared")
     w_charged  = data.get("shipment_weight_charged")
     zone_str   = data.get("zone")
     zone_idx   = detect_zone_idx(zone_str)
 
-    # ── Rule 1: Weight slab vs real rate card ─────────────────────────────
+    # ── Rule 1: Rate card mismatch ────────────────────────────────────────
     if freight and courier and zone_idx is not None:
         result = get_rate(courier, plan, zone_idx)
         if result:
             expected_rate, cod_pct, cod_min = result
             diff = freight - expected_rate
             if abs(diff) > 8:
-                add("Weight/Rate Mismatch", "ERROR",
+                add("Rate Card Mismatch", "ERROR",
                     f"Charged ₹{freight:.2f} but Shiprocket {plan} plan rate for "
                     f"{courier} ({zone_str}) is ₹{expected_rate:.2f}/0.5kg.",
                     expected=f"₹{expected_rate:.2f}", actual=f"₹{freight:.2f}",
                     diff=f"₹{diff:+.2f}")
     elif freight and courier and zone_idx is None:
         add("Zone Not Detected", "INFO",
-            f"Could not detect shipping zone — cannot verify rate card for {courier}. "
-            f"Add zone info to enable full rate check.")
+            f"Cannot verify rate card for {courier} — zone not found in invoice.",
+            actionable=False)
 
-    # ── Rule 2: GST rate check — Shiprocket uses 18% IGST (SAC 996812) ───
+    # ── Rule 2: GST rate ──────────────────────────────────────────────────
     if igst_rate is not None and igst_rate != 18:
         add("Wrong GST Rate", "ERROR",
-            f"Shiprocket freight services (SAC 996812) are taxed at 18% IGST. "
+            f"Shiprocket freight (SAC 996812) must be taxed at 18% IGST. "
             f"Invoice shows {igst_rate}%.",
             expected="18%", actual=f"{igst_rate}%")
 
-    # ── Rule 3: GST amount calculation ────────────────────────────────────
+    # ── Rule 3: GST amount ────────────────────────────────────────────────
     if subtotal and gst:
         expected_gst = round(subtotal * SHIPROCKET_GST, 2)
         diff = gst - expected_gst
         if abs(diff) > 2:
             add("GST Miscalculation", "ERROR",
                 f"GST should be ₹{expected_gst:.2f} (18% of ₹{subtotal:.2f}) "
-                f"but invoice shows ₹{gst:.2f}. Difference: ₹{diff:+.2f}",
-                expected=f"₹{expected_gst:.2f}", actual=f"₹{gst:.2f}", diff=f"₹{diff:+.2f}")
+                f"but invoice shows ₹{gst:.2f}. Diff: ₹{diff:+.2f}",
+                expected=f"₹{expected_gst:.2f}", actual=f"₹{gst:.2f}",
+                diff=f"₹{diff:+.2f}")
 
-    # ── Rule 4: SAC code verification ────────────────────────────────────
+    # ── Rule 4: SAC code ──────────────────────────────────────────────────
     if sac and sac != SHIPROCKET_SAC:
         add("Wrong SAC Code", "WARNING",
-            f"Shiprocket freight invoices should use SAC 996812. "
-            f"Invoice shows SAC {sac}.",
+            f"Shiprocket freight invoices must use SAC 996812. Invoice shows {sac}.",
             expected=SHIPROCKET_SAC, actual=sac)
 
-    # ── Rule 5: COD charge on Prepaid shipment ────────────────────────────
+    # ── Rule 5: COD on Prepaid ────────────────────────────────────────────
     if mode == "PREPAID":
         cod = data.get("cod_charge") or 0
         if cod > 0:
             add("COD Charge on Prepaid", "ERROR",
-                f"Shipment is Prepaid but a COD charge of ₹{cod:.2f} was billed. "
-                f"COD charges should only apply to Cash on Delivery orders.",
+                f"Shipment is Prepaid but COD charge of ₹{cod:.2f} was billed. "
+                f"Should be ₹0 — raise dispute immediately.",
                 expected="₹0.00", actual=f"₹{cod:.2f}", diff=f"₹{cod:+.2f}")
 
-    # ── Rule 6: Duplicate invoice / AWB detection ─────────────────────────
+    # ── Rule 6: Duplicate invoice / AWB ───────────────────────────────────
     if inv_no:
         if inv_no in seen_invoices:
             add("Duplicate Invoice", "ERROR",
-                f"Invoice {inv_no} has already been processed in this session — "
-                f"possible double billing.",
-                expected="Unique invoice", actual=inv_no)
+                f"Invoice {inv_no} already processed this session — possible double billing.",
+                expected="Unique", actual=inv_no)
         seen_invoices.add(inv_no)
-
     if awb:
         if awb in seen_awbs:
             add("Duplicate AWB", "ERROR",
-                f"AWB {awb} has already been billed in this session — "
-                f"same shipment billed twice.",
-                expected="Unique AWB", actual=awb)
+                f"AWB {awb} already billed this session — same shipment charged twice.",
+                expected="Unique", actual=awb)
         seen_awbs.add(awb)
 
-    # ── Rule 7: Excess weight charge scrutiny ────────────────────────────
+    # ── Rule 7: Excess weight ─────────────────────────────────────────────
     if excess and excess > 0:
         if w_declared and w_charged and w_charged > w_declared:
             diff_kg = w_charged - w_declared
             add("Excess Weight Charge", "WARNING",
-                f"Excess weight charge of ₹{excess:.2f} applied — courier measured "
-                f"{w_charged}kg vs declared {w_declared}kg (diff: {diff_kg:.2f}kg). "
-                f"Raise dispute within 7 days if measurement is incorrect.",
+                f"Courier measured {w_charged}kg vs declared {w_declared}kg "
+                f"(+{diff_kg:.2f}kg). Excess charge: ₹{excess:.2f}. "
+                f"Dispute within {DISPUTE_WINDOW_DAYS} days if measurement is incorrect.",
                 expected=f"{w_declared}kg", actual=f"{w_charged}kg",
                 diff=f"+{diff_kg:.2f}kg")
         else:
             add("Unverified Excess Weight", "WARNING",
-                f"Excess weight charge of ₹{excess:.2f} detected but declared/charged "
-                f"weights not found. Verify with courier's weight dispute portal.")
+                f"Excess weight charge of ₹{excess:.2f} found but declared/charged "
+                f"weights missing. Verify with courier portal.")
 
-    # ── Rule 8: Mystery / unknown surcharges ─────────────────────────────
+    # ── Rule 8: Mystery surcharges ────────────────────────────────────────
     if mystery:
         for item in mystery:
             add("Unknown Surcharge", "WARNING",
-                f"Unrecognised line item detected: '{item}'. "
-                f"This does not match any standard Shiprocket charge type. "
-                f"Verify with account manager.")
+                f"'{item}' is not a standard Shiprocket charge type. "
+                f"Request line-item justification from your account manager.")
 
     if not findings:
         findings.append({
             "rule": "All Clear", "severity": "OK",
-            "message": "No billing anomalies detected. Invoice matches expected rates and calculations.",
-            "expected": None, "actual": None, "difference": None,
+            "message": "No billing anomalies detected.",
+            "expected": None, "actual": None, "difference": None, "actionable": False,
         })
 
     return findings
 
 # ─────────────────────────────────────────────────────────────────────────────
+# DISPUTE LETTER GENERATOR
+# ─────────────────────────────────────────────────────────────────────────────
+def generate_dispute_letter(data: dict, findings: list, overcharge: float) -> str:
+    inv_no    = data.get("invoice_number", "N/A")
+    inv_date  = data.get("invoice_date",  "N/A")
+    awb       = data.get("awb_number",    "N/A")
+    courier   = data.get("courier_partner", "N/A")
+    client    = data.get("client_name",   "[Your Company Name]")
+    gstin     = data.get("client_gstin",  "[Your GSTIN]")
+    total     = data.get("grand_total",   0) or 0
+
+    error_lines = []
+    for f in findings:
+        if f["severity"] in ("ERROR", "WARNING") and f.get("actionable", True):
+            line = f"  • {f['rule']}: {f['message']}"
+            if f.get("difference"):
+                line += f" (Overcharge: {f['difference']})"
+            error_lines.append(line)
+
+    errors_text = "\n".join(error_lines) if error_lines else "  • Please refer to the attached audit report."
+
+    return f"""Subject: Billing Dispute — Invoice {inv_no} | AWB {awb} | Overcharge ₹{overcharge:.2f}
+
+To: support@shiprocket.in
+CC: [Your Account Manager]
+
+Dear Shiprocket Billing Team,
+
+I am writing to formally dispute Invoice No. {inv_no} dated {inv_date} for the following billing discrepancies identified during our internal audit:
+
+Company: {client}
+GSTIN: {gstin}
+Invoice No.: {inv_no}
+Invoice Date: {inv_date}
+AWB Number: {awb}
+Courier Partner: {courier}
+Invoice Total Billed: ₹{total:,.2f}
+Total Disputed Amount: ₹{overcharge:.2f}
+
+DISCREPANCIES IDENTIFIED:
+{errors_text}
+
+We request the following actions within 48 hours:
+1. Review and confirm the above discrepancies
+2. Issue a credit note for ₹{overcharge:.2f} against the disputed charges
+3. Provide corrected invoice with proper line-item justification
+
+Please note that as per Shiprocket's billing policy, excess weight disputes must be raised within 7 days of invoice date. This dispute is being raised within the stipulated window.
+
+Kindly acknowledge receipt of this email and provide a resolution timeline.
+
+Regards,
+{client}
+GSTIN: {gstin}
+
+---
+This dispute letter was generated by Invoice Auditor.
+Audit timestamp: {datetime.now().strftime('%d %b %Y, %I:%M %p')}"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ROI CALCULATOR
+# ─────────────────────────────────────────────────────────────────────────────
+def compute_roi(monthly_invoices: int, avg_invoice_value: float, error_rate_pct: float) -> dict:
+    monthly_billing   = monthly_invoices * avg_invoice_value
+    overcharge_rate   = error_rate_pct / 100
+    monthly_overcharge = monthly_billing * overcharge_rate
+    annual_overcharge  = monthly_overcharge * 12
+    # Assumes 70% recovery rate (realistic — some disputes rejected or window missed)
+    recovery_rate     = 0.70
+    annual_recovery   = annual_overcharge * recovery_rate
+    return {
+        "monthly_billing":    monthly_billing,
+        "monthly_overcharge": monthly_overcharge,
+        "annual_overcharge":  annual_overcharge,
+        "annual_recovery":    annual_recovery,
+    }
+
+# ─────────────────────────────────────────────────────────────────────────────
 # STREAMLIT UI
 # ─────────────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="AI Invoice Auditor", page_icon="🧾", layout="wide")
+st.set_page_config(page_title="Invoice Auditor", page_icon="🧾", layout="wide")
 
 st.markdown("""
 <style>
@@ -382,11 +449,11 @@ st.markdown("""
 html,body,[data-testid="stAppViewContainer"]{background:var(--bg)!important;color:var(--text)!important;font-family:'Inter',sans-serif!important;}
 [data-testid="stSidebar"]{background:var(--surface)!important;border-right:1px solid var(--border)!important;}
 .block-container{padding-top:1.5rem!important;max-width:1200px!important;}
-h1,h2,h3{font-family:'Inter',sans-serif!important;color:var(--text)!important;}
+h1,h2,h3,h4{font-family:'Inter',sans-serif!important;color:var(--text)!important;}
 .stButton>button{background:var(--accent2)!important;color:#fff!important;border:none!important;border-radius:6px!important;font-weight:600!important;padding:.5rem 1.4rem!important;}
 .metric-box{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:.9rem 1rem;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,.06);}
-.metric-value{font-size:1.6rem;font-weight:700;font-family:'JetBrains Mono',monospace;}
-.metric-label{font-size:.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-top:3px;}
+.metric-value{font-size:1.5rem;font-weight:700;font-family:'JetBrains Mono',monospace;}
+.metric-label{font-size:.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-top:3px;}
 .card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:1rem 1.2rem;margin-bottom:.75rem;box-shadow:0 1px 2px rgba(0,0,0,.04);}
 .fe{border-left:4px solid var(--error)!important;}
 .fw{border-left:4px solid var(--warning)!important;}
@@ -401,12 +468,15 @@ h1,h2,h3{font-family:'Inter',sans-serif!important;color:var(--text)!important;}
 .status-fail{background:#fef2f2;color:#991b1b;border:1px solid #fca5a5;padding:4px 14px;border-radius:6px;font-weight:700;}
 .status-review{background:#fffbeb;color:#92400e;border:1px solid #fde68a;padding:4px 14px;border-radius:6px;font-weight:700;}
 .insight{background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:.8rem 1rem;font-size:.84rem;color:#1e40af;margin:.5rem 0;}
-stFileUploader>div{border-radius:8px!important;}
+.roi-box{background:linear-gradient(135deg,#0f4c81,#1a73e8);color:white;border-radius:12px;padding:1.2rem 1.4rem;margin-bottom:.75rem;}
+.urgency-open{background:#f0fdf4;border:1px solid #86efac;color:#166534;border-radius:6px;padding:3px 10px;font-size:.78rem;font-weight:600;}
+.urgency-urgent{background:#fffbeb;border:1px solid #fde68a;color:#92400e;border-radius:6px;padding:3px 10px;font-size:.78rem;font-weight:600;}
+.urgency-closed{background:#fef2f2;border:1px solid #fecaca;color:#991b1b;border-radius:6px;padding:3px 10px;font-size:.78rem;font-weight:600;}
 </style>
 """, unsafe_allow_html=True)
 
 # Session state
-for k, v in [("seen_invoices", set()), ("seen_awbs", set()), ("history", []), ("batch_totals", {})]:
+for k, v in [("seen_invoices", set()), ("seen_awbs", set()), ("history", [])]:
     if k not in st.session_state:
         st.session_state[k] = v
 
@@ -414,14 +484,11 @@ for k, v in [("seen_invoices", set()), ("seen_awbs", set()), ("history", []), ("
 with st.sidebar:
     st.markdown("## ⚙️ Configuration")
     api_key = st.text_input("Anthropic API Key", type="password", placeholder="sk-ant-...",
-                            help="Powers 95%+ extraction accuracy via Claude. Leave blank for regex fallback.")
+                            help="Powers 95%+ field extraction via Claude. Leave blank for regex fallback.")
     st.markdown("---")
-    plan = st.selectbox("Your Shiprocket Plan",
-                        ["Lite", "Basic", "Advanced"],
-                        index=1,
-                        help="Determines which rate card is used for audit checks.")
+    plan = st.selectbox("Your Shiprocket Plan", ["Lite", "Basic", "Advanced"], index=1)
     courier_view = st.selectbox("Preview Rate Card", list(SHIPROCKET_RATES.keys()))
-    st.markdown(f"**{courier_view} — {plan} Plan rates (₹/0.5kg)**")
+    st.markdown(f"**{courier_view} — {plan} Plan (₹/0.5kg)**")
     rates_data = SHIPROCKET_RATES[courier_view][plan]
     for i, zone in enumerate(ZONE_NAMES):
         st.markdown(
@@ -435,12 +502,32 @@ with st.sidebar:
         f"COD: {rates_data['cod_pct']}% (min ₹{rates_data['cod_min']})</div>",
         unsafe_allow_html=True)
     st.markdown("---")
-    st.caption("📊 Rate source: Shiprocket published rate sheet 2024-25")
+
+    # ── ROI CALCULATOR in sidebar ─────────────────────────────────────────
+    st.markdown("### 💹 Recovery ROI Calculator")
+    st.caption("Estimate annual savings from auditing")
+    roi_invoices = st.number_input("Invoices / month", min_value=1, value=200, step=10)
+    roi_avg_val  = st.number_input("Avg invoice value (₹)", min_value=100, value=500, step=50)
+    roi_err_rate = st.slider("Assumed error rate (%)", 1.0, 15.0, 7.0, 0.5,
+                             help="Industry average is 5–10%")
+    roi = compute_roi(roi_invoices, roi_avg_val, roi_err_rate)
+    st.markdown(
+        f"<div class='roi-box'>"
+        f"<div style='font-size:.75rem;opacity:.8;text-transform:uppercase;letter-spacing:.05em'>Monthly billing</div>"
+        f"<div style='font-size:1.1rem;font-weight:700;margin-bottom:.6rem'>₹{roi['monthly_billing']:,.0f}</div>"
+        f"<div style='font-size:.75rem;opacity:.8;text-transform:uppercase;letter-spacing:.05em'>Est. monthly overcharge</div>"
+        f"<div style='font-size:1.1rem;font-weight:700;margin-bottom:.6rem'>₹{roi['monthly_overcharge']:,.0f}</div>"
+        f"<div style='font-size:.75rem;opacity:.8;text-transform:uppercase;letter-spacing:.05em'>Annual recovery potential (70%)</div>"
+        f"<div style='font-size:1.4rem;font-weight:700'>₹{roi['annual_recovery']:,.0f}</div>"
+        f"</div>",
+        unsafe_allow_html=True)
+
+    st.markdown("---")
+    st.caption("📊 Rate source: Shiprocket rate sheet 2024-25")
     if st.button("🗑️ Reset Session"):
         st.session_state.seen_invoices = set()
         st.session_state.seen_awbs     = set()
         st.session_state.history       = []
-        st.session_state.batch_totals  = {}
         st.success("Session cleared.")
 
 # ── HEADER ────────────────────────────────────────────────────────────────────
@@ -450,51 +537,44 @@ padding-bottom:1rem;border-bottom:1px solid #e2e8f0'>
   <div style='background:#0f4c81;color:white;width:48px;height:48px;border-radius:10px;
   display:flex;align-items:center;justify-content:center;font-size:1.5rem'>🧾</div>
   <div>
-    <h1 style='margin:0;font-size:1.75rem;color:#0f172a'> Invoice Auditor</h1>
+    <h1 style='margin:0;font-size:1.75rem;color:#0f172a'>Invoice Auditor</h1>
     <p style='margin:0;color:#64748b;font-size:.88rem'>
-    Shiprocket Logistics · Real-time Billing Anomaly Detection · SAC 996812 · IGST 18%</p>
+    Shiprocket Logistics · Billing Anomaly Detection · SAC 996812 · IGST 18%</p>
   </div>
 </div>""", unsafe_allow_html=True)
 
-# D2C Insight callout
 st.markdown("""<div class='insight'>
-💡 <b>Why this matters:</b> 5–10% of logistics invoices contain overcharges — on ₹50L/month in shipping,
-that's ₹2.5–5L/month in recoverable costs. Common patterns: excess weight disputes (courier vs declared weight),
-wrong zone billing, COD charges on prepaid orders, and duplicate AWB billing after RTO.
+💡 <b>Why this matters:</b> 5–10% of logistics invoices contain overcharges. On ₹50L/month in shipping
+that's ₹2.5–5L/month in recoverable costs. Common patterns: excess weight disputes, wrong zone billing,
+COD charges on prepaid orders, and duplicate AWB billing after RTO.
+Shiprocket's dispute window is <b>7 days</b> — manual checking misses it. This tool catches it at receipt.
 </div>""", unsafe_allow_html=True)
 
 # ── UPLOAD ────────────────────────────────────────────────────────────────────
 st.markdown("### Upload Invoice")
 col1, col2 = st.columns(2)
 with col1:
-    invoice_files = st.file_uploader(
-        "📄 Invoice PDF(s) — drop multiple for batch audit",
-        type=["pdf"], accept_multiple_files=True)
+    invoice_files = st.file_uploader("📄 Invoice PDF(s) — drop multiple for batch audit",
+                                     type=["pdf"], accept_multiple_files=True)
 with col2:
-    label_file = st.file_uploader(
-        "🏷️ Shipment Label (optional — for AWB cross-check)",
-        type=["pdf","png","jpg","jpeg"])
+    label_file = st.file_uploader("🏷️ Shipment Label (optional)",
+                                  type=["pdf","png","jpg","jpeg"])
 
 if not OCR_AVAILABLE:
     st.error("pytesseract / pdf2image not installed. Run: pip install pytesseract pillow pdf2image")
 
-run_btn = st.button("🔍 Run Audit", disabled=(not invoice_files or not OCR_AVAILABLE),
-                    use_container_width=False)
+run_btn = st.button("🔍 Run Audit", disabled=(not invoice_files or not OCR_AVAILABLE))
 
 # ── PIPELINE ──────────────────────────────────────────────────────────────────
 if run_btn and invoice_files:
-
     all_results = []
 
     for invoice_file in invoice_files:
         with st.expander(f"📄 Processing: {invoice_file.name}", expanded=True):
-
             prog = st.progress(0, text="Reading file…")
-
             pdf_bytes = invoice_file.read()
             file_hash = hashlib.md5(pdf_bytes).hexdigest()[:8].upper()
 
-            # OCR
             prog.progress(25, text="Running OCR…")
             try:
                 ocr_text = extract_text_from_pdf(pdf_bytes)
@@ -502,7 +582,6 @@ if run_btn and invoice_files:
                 st.error(f"OCR failed: {e}")
                 continue
 
-            # Label OCR (optional)
             if label_file and len(invoice_files) == 1:
                 try:
                     lb = label_file.read()
@@ -514,7 +593,6 @@ if run_btn and invoice_files:
                 except Exception:
                     pass
 
-            # Extract fields
             prog.progress(55, text="Extracting fields…")
             use_llm = bool(api_key and ANTHROPIC_AVAILABLE)
             parse_method = "Claude AI" if use_llm else "Regex Fallback"
@@ -526,7 +604,6 @@ if run_btn and invoice_files:
                 data = parse_regex_fallback(ocr_text)
                 parse_method = "Regex Fallback (LLM error)"
 
-            # Compute total_gst if not extracted
             if not data.get("total_gst"):
                 data["total_gst"] = (
                     (data.get("igst_amount") or 0) +
@@ -534,7 +611,6 @@ if run_btn and invoice_files:
                     (data.get("sgst_amount") or 0) or None
                 )
 
-            # Audit
             prog.progress(80, text="Running audit rules…")
             findings = run_audit(data, st.session_state.seen_invoices,
                                  st.session_state.seen_awbs, plan)
@@ -548,7 +624,7 @@ if run_btn and invoice_files:
             all_results.append({"data": data, "findings": findings})
             prog.progress(100, text="✅ Done")
 
-    # ── REPORT ────────────────────────────────────────────────────────────────
+    # ── REPORT ────────────────────────────────────────────────────────────
     for result in all_results:
         data     = result["data"]
         findings = result["findings"]
@@ -562,7 +638,6 @@ if run_btn and invoice_files:
         status   = "FAIL" if errors else ("REVIEW" if warnings else "PASS")
         s_cls    = {"FAIL":"status-fail","REVIEW":"status-review","PASS":"status-pass"}[status]
 
-        # Calculate total overcharge
         overcharge = 0.0
         for f in findings:
             if f.get("difference"):
@@ -573,25 +648,34 @@ if run_btn and invoice_files:
                 except (ValueError, TypeError):
                     pass
 
-        # Metrics
-        c1,c2,c3,c4,c5,c6 = st.columns(6)
-        for col, (val, label, color) in zip([c1,c2,c3,c4,c5,c6], [
-            (f"<span class='{s_cls}'>{status}</span>", "Audit Status", None),
-            (str(errors),                               "Errors",              "#dc2626"),
-            (str(warnings),                             "Warnings",            "#d97706"),
-            (f"₹{data.get('grand_total') or 0:,.2f}",  "Grand Total",         "#0f4c81"),
-            (f"₹{overcharge:,.2f}",                    "Overcharge Found",    "#dc2626"),
-            (data.get("awb_number") or "—",            "AWB Number",          "#1a73e8"),
+        # Dispute window urgency
+        urgency_label, urgency_color, days_left = dispute_urgency(data.get("invoice_date"))
+
+        # ── Metrics ───────────────────────────────────────────────────────
+        c1,c2,c3,c4,c5,c6,c7 = st.columns(7)
+        for col, (val, label, color) in zip([c1,c2,c3,c4,c5,c6,c7], [
+            (f"<span class='{s_cls}'>{status}</span>", "Audit Status",     None),
+            (str(errors),                              "Errors",           "#dc2626"),
+            (str(warnings),                            "Warnings",         "#d97706"),
+            (f"₹{data.get('grand_total') or 0:,.2f}", "Grand Total",      "#0f4c81"),
+            (f"₹{overcharge:,.2f}",                   "Overcharge",       "#dc2626"),
+            (data.get("awb_number") or "—",           "AWB",              "#1a73e8"),
+            (f"<span style='color:{urgency_color};font-size:.85rem;font-weight:600'>{urgency_label}</span>",
+             "Dispute Window", None),
         ]):
             with col:
                 if color:
                     st.markdown(
-                        f"<div class='metric-box'><div class='metric-value' style='color:{color}'>{val}</div>"
-                        f"<div class='metric-label'>{label}</div></div>", unsafe_allow_html=True)
+                        f"<div class='metric-box'>"
+                        f"<div class='metric-value' style='color:{color}'>{val}</div>"
+                        f"<div class='metric-label'>{label}</div></div>",
+                        unsafe_allow_html=True)
                 else:
                     st.markdown(
-                        f"<div class='metric-box'><div style='margin:.2rem 0'>{val}</div>"
-                        f"<div class='metric-label'>{label}</div></div>", unsafe_allow_html=True)
+                        f"<div class='metric-box'>"
+                        f"<div style='margin:.25rem 0;font-size:.95rem'>{val}</div>"
+                        f"<div class='metric-label'>{label}</div></div>",
+                        unsafe_allow_html=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
 
@@ -611,20 +695,18 @@ if run_btn and invoice_files:
                 "subtotal":"💰","grand_total":"💵","amount_due":"⚠️",
                 "invoice_status":"🏷️","state_of_supply":"📍",
             }
-            display = {k: v for k,v in data.items()
-                       if not k.startswith("_") and v is not None
-                       and k not in ("hsn_codes","mystery_line_items","reverse_charge",
-                                     "other_charges","cgst_amount","sgst_amount",
-                                     "order_value","shipment_weight_declared",
-                                     "shipment_weight_charged")
-                       or k in ("shipment_weight_declared","shipment_weight_charged") and v}
-            for field, value in display.items():
+            skip = {"hsn_codes","mystery_line_items","reverse_charge","other_charges",
+                    "cgst_amount","sgst_amount","order_value"}
+            for field, value in data.items():
+                if field.startswith("_") or field in skip or value is None:
+                    continue
                 icon  = icon_map.get(field, "•")
                 label = field.replace("_"," ").title()
                 if isinstance(value, float):
                     disp = (f"₹{value:,.2f}"
                             if any(x in field for x in ("charge","total","amount","value","gst","subtotal"))
-                            else f"{value} kg" if "weight" in field else f"{value}%")
+                            else f"{value} kg" if "weight" in field
+                            else f"{value}%")
                 else:
                     disp = str(value)
                 st.markdown(
@@ -632,10 +714,8 @@ if run_btn and invoice_files:
                     f"display:flex;justify-content:space-between;align-items:center'>"
                     f"<span style='color:#64748b;font-size:.83rem'>{icon} {label}</span>"
                     f"<span style='font-weight:600;font-family:JetBrains Mono,monospace;"
-                    f"font-size:.85rem;color:#0f172a'>{disp}</span></div>",
+                    f"font-size:.85rem'>{disp}</span></div>",
                     unsafe_allow_html=True)
-
-            # Parse method badge
             pm_color = "#1d4ed8" if "Claude" in data["_meta"]["parse_method"] else "#64748b"
             st.markdown(
                 f"<div style='font-size:.75rem;color:{pm_color};margin-top:.3rem'>"
@@ -649,8 +729,8 @@ if run_btn and invoice_files:
             bc_map   = {"ERROR":"be","WARNING":"bw","INFO":"bi","OK":"bok"}
             for f in findings:
                 sev  = f["severity"]
-                fc   = fc_map.get(sev, "fi")
-                bc   = bc_map.get(sev, "bi")
+                fc   = fc_map.get(sev,"fi")
+                bc   = bc_map.get(sev,"bi")
                 icon = sev_icon.get(sev,"ℹ️")
                 extra = ""
                 if f.get("expected"):
@@ -668,6 +748,20 @@ if run_btn and invoice_files:
                     f"{extra}</div>",
                     unsafe_allow_html=True)
 
+        # ── DISPUTE LETTER ─────────────────────────────────────────────────
+        if errors > 0 or warnings > 0:
+            st.markdown("---")
+            st.markdown("#### ✉️ Dispute Letter")
+            st.caption("Ready-to-send dispute email for Shiprocket billing team — edit before sending")
+            dispute_text = generate_dispute_letter(data, findings, overcharge)
+            st.text_area("Dispute Letter", dispute_text, height=320,
+                         label_visibility="collapsed")
+            st.download_button(
+                "⬇️ Download Dispute Letter (.txt)",
+                data=dispute_text,
+                file_name=f"dispute_{inv_label}_{datetime.now().strftime('%Y%m%d')}.txt",
+                mime="text/plain")
+
         with st.expander("🔍 Raw OCR Text"):
             st.text(ocr_text[:5000])
         with st.expander("📦 Full Extracted JSON"):
@@ -676,12 +770,13 @@ if run_btn and invoice_files:
         report = {
             "invoice": {k: v for k,v in data.items() if not k.startswith("_")},
             "findings": findings,
-            "summary": {"status": status, "errors": errors,
-                        "warnings": warnings, "overcharge_inr": overcharge,
-                        "plan_used": plan, "audited_at": data["_meta"]["audited_at"]},
+            "summary": {"status": status, "errors": errors, "warnings": warnings,
+                        "overcharge_inr": overcharge, "plan_used": plan,
+                        "dispute_window": urgency_label,
+                        "audited_at": data["_meta"]["audited_at"]},
         }
         st.download_button(
-            f"⬇️ Download Audit Report — {inv_label}",
+            f"⬇️ Download Audit Report (JSON)",
             data=json.dumps(report, indent=2),
             file_name=f"audit_{data['_meta']['hash']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
             mime="application/json")
@@ -691,27 +786,46 @@ if st.session_state.history:
     st.markdown("---")
     st.markdown("## 📈 Session Summary Dashboard")
 
-    total_billed    = sum((e["data"].get("grand_total") or 0) for e in st.session_state.history)
-    total_errors    = sum(sum(1 for f in e["findings"] if f["severity"]=="ERROR") for e in st.session_state.history)
-    total_warnings  = sum(sum(1 for f in e["findings"] if f["severity"]=="WARNING") for e in st.session_state.history)
-    total_overcharge = 0.0
+    total_billed      = sum((e["data"].get("grand_total") or 0) for e in st.session_state.history)
+    total_errors      = sum(sum(1 for f in e["findings"] if f["severity"]=="ERROR") for e in st.session_state.history)
+    total_warnings    = sum(sum(1 for f in e["findings"] if f["severity"]=="WARNING") for e in st.session_state.history)
+    total_overcharge  = 0.0
+    overcharge_by_rule = {}
+    invoice_overcharges = []
+    sev_counts = {"ERROR": 0, "WARNING": 0, "INFO": 0, "OK": 0}
+
     for entry in st.session_state.history:
+        inv_overcharge = 0.0
         for f in entry["findings"]:
+            sev_counts[f["severity"]] = sev_counts.get(f["severity"], 0) + 1
             if f.get("difference"):
                 try:
                     v = float(str(f["difference"]).replace("₹","").replace("+","").replace(",",""))
                     if v > 0:
                         total_overcharge += v
+                        inv_overcharge   += v
+                        overcharge_by_rule[f["rule"]] = overcharge_by_rule.get(f["rule"], 0) + v
                 except (ValueError, TypeError):
                     pass
+        inv_label_chart = (entry["data"].get("invoice_number") or entry["data"]["_meta"]["file"])[:18]
+        invoice_overcharges.append({
+            "invoice":    inv_label_chart,
+            "billed":     entry["data"].get("grand_total") or 0,
+            "overcharge": inv_overcharge,
+        })
 
-    c1,c2,c3,c4,c5 = st.columns(5)
-    for col, (val, label, color) in zip([c1,c2,c3,c4,c5],[
-        (str(len(st.session_state.history)), "Invoices Audited",  "#0f4c81"),
-        (f"₹{total_billed:,.2f}",            "Total Billed",      "#0f4c81"),
-        (f"₹{total_overcharge:,.2f}",         "Total Overcharges", "#dc2626"),
-        (str(total_errors),                   "Total Errors",      "#dc2626"),
-        (str(total_warnings),                 "Total Warnings",    "#d97706"),
+    total_correct    = max(0, total_billed - total_overcharge)
+    annual_leakage   = total_overcharge * 12
+
+    # ── Summary metrics ───────────────────────────────────────────────────
+    c1,c2,c3,c4,c5,c6 = st.columns(6)
+    for col, (val, label, color) in zip([c1,c2,c3,c4,c5,c6],[
+        (str(len(st.session_state.history)), "Invoices Audited",   "#0f4c81"),
+        (f"₹{total_billed:,.2f}",            "Total Billed",       "#0f4c81"),
+        (f"₹{total_overcharge:,.2f}",         "Total Overcharge",   "#dc2626"),
+        (f"₹{annual_leakage:,.0f}",           "Annualised Leakage", "#dc2626"),
+        (str(total_errors),                   "Total Errors",       "#dc2626"),
+        (str(total_warnings),                 "Total Warnings",     "#d97706"),
     ]):
         with col:
             st.markdown(
@@ -719,6 +833,95 @@ if st.session_state.history:
                 f"<div class='metric-label'>{label}</div></div>", unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── CHARTS ────────────────────────────────────────────────────────────
+    if PLOTLY:
+        chart_col1, chart_col2 = st.columns(2)
+
+        with chart_col1:
+            st.markdown("#### 💰 Billed vs Correct Amount")
+            fig1 = go.Figure(data=[
+                go.Bar(name="Total Billed",   x=["Amount"], y=[total_billed],
+                       marker_color="#1a73e8", text=[f"₹{total_billed:,.0f}"], textposition="outside"),
+                go.Bar(name="Correct Amount", x=["Amount"], y=[total_correct],
+                       marker_color="#16a34a", text=[f"₹{total_correct:,.0f}"], textposition="outside"),
+                go.Bar(name="Overcharged",    x=["Amount"], y=[total_overcharge],
+                       marker_color="#dc2626", text=[f"₹{total_overcharge:,.0f}"], textposition="outside"),
+            ])
+            fig1.update_layout(barmode="group", height=300,
+                margin=dict(t=20,b=20,l=10,r=10),
+                plot_bgcolor="white", paper_bgcolor="white",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                yaxis=dict(tickprefix="₹", gridcolor="#f1f5f9"),
+                font=dict(family="Inter", size=11))
+            st.plotly_chart(fig1, use_container_width=True)
+
+        with chart_col2:
+            st.markdown("#### 📊 Findings by Severity")
+            sev_filtered = {k: v for k,v in sev_counts.items() if v > 0}
+            if sev_filtered:
+                color_map = {"ERROR":"#dc2626","WARNING":"#d97706","INFO":"#1a73e8","OK":"#16a34a"}
+                fig2 = go.Figure(data=[go.Pie(
+                    labels=list(sev_filtered.keys()),
+                    values=list(sev_filtered.values()),
+                    marker_colors=[color_map.get(k,"#94a3b8") for k in sev_filtered],
+                    hole=0.45, textinfo="label+percent", textfont_size=12,
+                )])
+                fig2.update_layout(height=300, margin=dict(t=20,b=20,l=10,r=10),
+                    paper_bgcolor="white", showlegend=False,
+                    font=dict(family="Inter", size=11),
+                    annotations=[dict(text=f"{sum(sev_filtered.values())}<br>findings",
+                                      x=0.5, y=0.5, font_size=13, showarrow=False)])
+                st.plotly_chart(fig2, use_container_width=True)
+
+        chart_col3, chart_col4 = st.columns(2)
+
+        with chart_col3:
+            st.markdown("#### 🔍 Overcharge by Type")
+            if overcharge_by_rule:
+                rules  = list(overcharge_by_rule.keys())
+                values = list(overcharge_by_rule.values())
+                fig3 = go.Figure(go.Bar(
+                    x=values, y=rules, orientation="h",
+                    marker_color="#dc2626",
+                    text=[f"₹{v:,.0f}" for v in values], textposition="outside",
+                ))
+                fig3.update_layout(height=max(250, len(rules)*55),
+                    margin=dict(t=10,b=20,l=10,r=60),
+                    plot_bgcolor="white", paper_bgcolor="white",
+                    xaxis=dict(tickprefix="₹", gridcolor="#f1f5f9"),
+                    yaxis=dict(automargin=True),
+                    font=dict(family="Inter", size=11))
+                st.plotly_chart(fig3, use_container_width=True)
+            else:
+                st.info("No quantified overcharges yet.")
+
+        with chart_col4:
+            st.markdown("#### 📦 Overcharge per Invoice")
+            inv_names  = [d["invoice"]    for d in invoice_overcharges]
+            inv_billed = [d["billed"]     for d in invoice_overcharges]
+            inv_over   = [d["overcharge"] for d in invoice_overcharges]
+            fig4 = go.Figure(data=[
+                go.Bar(name="Billed",      x=inv_names, y=inv_billed,
+                       marker_color="#1a73e8", opacity=0.7),
+                go.Bar(name="Overcharged", x=inv_names, y=inv_over,
+                       marker_color="#dc2626",
+                       text=[f"₹{v:,.0f}" if v > 0 else "" for v in inv_over],
+                       textposition="outside"),
+            ])
+            fig4.update_layout(barmode="overlay", height=300,
+                margin=dict(t=10,b=40,l=10,r=10),
+                plot_bgcolor="white", paper_bgcolor="white",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                yaxis=dict(tickprefix="₹", gridcolor="#f1f5f9"),
+                xaxis=dict(tickangle=-20),
+                font=dict(family="Inter", size=11))
+            st.plotly_chart(fig4, use_container_width=True)
+
+    elif not PLOTLY:
+        st.info("Install plotly for charts: `pip install plotly`")
+
+    # ── Invoice history ───────────────────────────────────────────────────
     st.markdown("#### Invoice History")
     for i, entry in enumerate(reversed(st.session_state.history), 1):
         d, fs = entry["data"], entry["findings"]
