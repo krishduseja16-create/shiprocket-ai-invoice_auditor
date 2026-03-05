@@ -719,8 +719,8 @@ if run_audit_btn and invoice_file:
     st.markdown("## 📊 Audit Report")
 
     # Metrics row
-errors   = sum(1 for f in findings if f["severity"] == "ERROR")
-warnings = sum(1 for f in findings if f["severity"] == "WARNING")
+errors = sum(1 for f in findings if f.get("severity") == "ERROR") if "findings" in locals() else 0
+warnings = sum(1 for f in findings if f.get("severity") == "WARNING") if "findings" in locals() else 0
 infos    = sum(1 for f in findings if f["severity"] == "INFO")
 status   = "FAIL" if errors else ("REVIEW" if warnings else "PASS")
 status_color = "#ef4444" if errors else ("#f59e0b" if warnings else "#22c55e")
