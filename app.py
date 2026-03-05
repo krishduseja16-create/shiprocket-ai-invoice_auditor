@@ -450,7 +450,7 @@ padding-bottom:1rem;border-bottom:1px solid #e2e8f0'>
   <div style='background:#0f4c81;color:white;width:48px;height:48px;border-radius:10px;
   display:flex;align-items:center;justify-content:center;font-size:1.5rem'>🧾</div>
   <div>
-    <h1 style='margin:0;font-size:1.75rem;color:#0f172a'>AI Invoice Auditor</h1>
+    <h1 style='margin:0;font-size:1.75rem;color:#0f172a'> Invoice Auditor</h1>
     <p style='margin:0;color:#64748b;font-size:.88rem'>
     Shiprocket Logistics · Real-time Billing Anomaly Detection · SAC 996812 · IGST 18%</p>
   </div>
