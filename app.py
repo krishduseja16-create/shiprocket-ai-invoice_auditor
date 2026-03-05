@@ -130,54 +130,146 @@ def parse_regex_fallback(text: str) -> dict:
         for p in patterns:
             m = re.search(p, text, re.I | re.M)
             if m:
-                val = m.group(1).strip().replace(",", "")
+                val = m.group(1).strip().replace(",", "").strip()
                 try:
                     return cast(val) if cast else val
                 except (ValueError, TypeError):
                     continue
         return None
 
+    # ── Payment mode — COD checked strictly first ─────────────────────────
     payment_mode = None
-    if re.search(r"\bcod\b|cash\s*on\s*delivery", text, re.I):
-        payment_mode = "COD"
-    elif re.search(r"\bprepaid\b", text, re.I):
-        payment_mode = "Prepaid"
+    # Check shipment details table row for payment mode
+    pm_match = re.search(r"(prepaid|cod|cash\s*on\s*delivery)", text, re.I)
+    if pm_match:
+        pm_val = pm_match.group(1).lower()
+        payment_mode = "COD" if "cod" in pm_val or "cash" in pm_val else "Prepaid"
 
-    courier = find([r"(bluedart|blue\s*dart|delhivery|xpressbees|ecom\s*express|dotzot|ekart|dtdc|shadowfax)"])
+    # ── Courier ───────────────────────────────────────────────────────────
+    courier = find([r"\b(bluedart|blue\s*dart|delhivery|xpressbees|ecom\s*express|dotzot|ekart|dtdc|shadowfax)\b"])
+
+    # ── Client name — look for company name after "Invoice To:" ───────────
+    # Strategy: find "Invoice To:" then grab the next line that looks like a company
+    client_name = None
+    invoice_to_match = re.search(
+        r"invoice\s*to[:\s]*\n(.*?)\n", text, re.I | re.M)
+    if invoice_to_match:
+        candidate = invoice_to_match.group(1).strip()
+        # Must be a real company name — not a label like "State Code" or short word
+        if (len(candidate) > 5
+                and not re.match(r"^(state|place|gstin|reverse|code|supply)", candidate, re.I)):
+            client_name = candidate
+    # Fallback: look for "Pvt Ltd" / "Ltd" pattern anywhere
+    if not client_name:
+        m = re.search(r"([A-Z][A-Za-z\s]{3,40}(?:Pvt\.?\s*Ltd|Limited|LLP|Inc))", text)
+        if m:
+            client_name = m.group(1).strip()
+
+    # ── Client GSTIN — pick the second GSTIN (first is vendor's) ─────────
+    all_gstins = re.findall(
+        r"\b([0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z])\b", text)
+    client_gstin = all_gstins[1] if len(all_gstins) >= 2 else (all_gstins[0] if all_gstins else None)
+
+    # ── Weights from shipment table ───────────────────────────────────────
+    # Look for pattern like "1.0 kg  3.5 kg" in the shipment details row
+    w_declared, w_charged = None, None
+    weight_row = re.search(
+        r"(\d+\.?\d*)\s*kg\s+(\d+\.?\d*)\s*kg", text, re.I)
+    if weight_row:
+        w_declared = float(weight_row.group(1))
+        w_charged  = float(weight_row.group(2))
+
+    # ── Freight charge — grab number after "Freight" line ─────────────────
+    freight = find([
+        r"shiprocket\s*v2?\s*freight[^\d]*([\d]+\.[\d]{2})",
+        r"freight[^\d\n]{0,40}?([\d]+\.[\d]{2})",
+    ], float)
+
+    # ── Excess weight charge ──────────────────────────────────────────────
+    excess = find([
+        r"excess\s*weight\s*charge[^\d]*([\d]+\.[\d]{2})",
+        r"excess\s*weight[^\d\n]{0,20}?([\d]+\.[\d]{2})",
+    ], float)
+
+    # ── COD charge ────────────────────────────────────────────────────────
+    cod_charge = find([
+        r"cod\s*handling\s*charge[^\d]*([\d]+\.[\d]{2})",
+        r"cod\s*charge[^\d]*([\d]+\.[\d]{2})",
+    ], float)
+
+    # ── Mystery line items — anything not matching standard charge types ──
+    mystery = []
+    known_patterns = [
+        "freight", "igst", "cgst", "sgst", "excess weight",
+        "cod handling", "cod charge", "rto", "shiprocket credit",
+        "cancelled", "grand total", "amount due"
+    ]
+    for line in text.split("\n"):
+        line_clean = line.strip().lower()
+        if (len(line_clean) > 5
+                and re.search(r"\d+\.\d{2}", line)
+                and not any(k in line_clean for k in known_patterns)
+                and not re.match(r"^\d", line_clean)
+                and "sac" not in line_clean
+                and "description" not in line_clean):
+            label = re.sub(r"[\d\.\,₹\s]+$", "", line.strip()).strip()
+            if label and len(label) > 5:
+                mystery.append(label)
+
+    # ── IGST rate & amount ────────────────────────────────────────────────
+    igst_rate = find([r"(\d+\.?\d*)\s*%\s*igst", r"igst\s*@\s*(\d+\.?\d*)"], float)
+    igst_amount = find([
+        r"\d+\.?\d*\s*%\s*igst\D{0,5}([\d]+\.[\d]{2})",
+        r"igst\D{0,10}([\d]+\.[\d]{2})",
+    ], float)
+
+    # ── Grand total ───────────────────────────────────────────────────────
+    grand_total = find([
+        r"grand\s*total\s*value\D{0,5}([\d]+\.[\d]{2})",
+        r"grand\s*total\D{0,5}([\d]+\.[\d]{2})",
+    ], float)
+
+    # ── Subtotal (sum of charges before GST) ──────────────────────────────
+    subtotal = None
+    charges = [c for c in [freight, excess, cod_charge,
+                            find([r"zone\s*upgrade[^\d]*([\d]+\.[\d]{2})"], float)]
+               if c is not None]
+    if charges:
+        subtotal = round(sum(charges), 2)
 
     return {
-        "invoice_number": find([r"invoice\s*(?:no|number|#)[.:\s]*([A-Z0-9\/\-]+)"]),
-        "invoice_date":   find([r"invoice\s*date[:\s]*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})"]),
-        "due_date":       find([r"due\s*date[:\s]*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})"]),
-        "vendor_name":    find([r"(bigfoot retail|shiprocket)"]),
-        "client_name":    find([r"invoice\s*to[:\s]*\n?([A-Za-z\s]+(?:pvt|ltd)?)"]),
-        "client_gstin":   find([r"gstin[:\s]*([0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z])"]),
-        "sac_code":       find([r"sac\s*(?:no|code)?[.:\s]*(\d{6})", r"\b(996812)\b"]),
-        "awb_number":     find([r"awb\s*(?:no|number)?[.:\s]*([A-Z0-9]{8,})", r"\b(\d{12,})\b"]),
-        "courier_partner": (courier or "").title() if courier else None,
-        "shipment_weight_declared": find([r"declared\s*weight[:\s]*([\d.]+)"], float),
-        "shipment_weight_charged":  find([r"chargeable\s*weight[:\s]*([\d.]+)"], float),
-        "payment_mode":   payment_mode,
-        "zone":           find([r"(within\s*city|within\s*state|metro.to.metro|rest\s*of\s*india|north\s*east)"]),
-        "freight_charge": find([r"(?:shiprocket\s*v2?\s*)?freight[^₹\d]*([\d,]+\.?\d*)"], float),
-        "excess_weight_charge": find([r"excess\s*weight[:\s]*([\d,]+\.?\d*)"], float),
-        "rto_charge":     find([r"rto[:\s]*([\d,]+\.?\d*)"], float),
-        "cod_charge":     find([r"cod\s*charge[:\s]*([\d,]+\.?\d*)"], float),
-        "other_charges":  None,
-        "igst_rate":      find([r"(\d+(?:\.\d+)?)\s*%\s*igst"], float),
-        "igst_amount":    find([r"igst[^₹\d]*([\d,]+\.?\d*)"], float),
-        "cgst_amount":    find([r"cgst[^₹\d]*([\d,]+\.?\d*)"], float),
-        "sgst_amount":    find([r"sgst[^₹\d]*([\d,]+\.?\d*)"], float),
-        "total_gst":      None,
-        "subtotal":       find([r"subtotal[:\s]*([\d,]+\.?\d*)"], float),
-        "grand_total":    find([r"grand\s*total\s*value[^₹\d]*([\d,]+\.?\d*)", r"grand\s*total[^₹\d]*([\d,]+\.?\d*)"], float),
-        "amount_due":     find([r"amount\s*due[^₹\d]*([\d,]+\.?\d*)"], float),
-        "order_value":    find([r"(?:order|declared)\s*value[:\s]*([\d,]+\.?\d*)"], float),
-        "hsn_codes":      re.findall(r"\b(\d{4,8})\b", text)[:5],
-        "mystery_line_items": [],
-        "invoice_status": "PAID" if re.search(r"\bpaid\b", text, re.I) else ("UNPAID" if re.search(r"\bunpaid\b", text, re.I) else None),
-        "state_of_supply": find([r"place\s*of\s*supply[:\s]*([A-Za-z\s]+)"]),
-        "reverse_charge": bool(re.search(r"reverse\s*charge[:\s]*yes", text, re.I)),
+        "invoice_number":           find([r"invoice\s*no\.?\s*[:\s]*([A-Z0-9\/\-]+)"]),
+        "invoice_date":             find([r"invoice\s*date\s*[:\s]*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})"]),
+        "due_date":                 find([r"due\s*date\s*[:\s]*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})"]),
+        "vendor_name":              find([r"(bigfoot retail solutions)", r"(shiprocket)"]),
+        "client_name":              client_name,
+        "client_gstin":             client_gstin,
+        "sac_code":                 find([r"\b(996812)\b", r"sac\s*no\.?\s*[:\s]*(\d{6})"]),
+        "awb_number":               find([r"awb\s*(?:no|number)?[:\s]*(\d{10,})", r"\b(\d{13})\b"]),
+        "courier_partner":          (courier or "").title() if courier else None,
+        "shipment_weight_declared": w_declared,
+        "shipment_weight_charged":  w_charged,
+        "payment_mode":             payment_mode,
+        "zone":                     find([r"(within\s*city|within\s*state|metro.to.metro|rest\s*of\s*india|north\s*east|ne\s*&\s*j.?k)"]),
+        "freight_charge":           freight,
+        "excess_weight_charge":     excess,
+        "rto_charge":               find([r"rto\s*freight[^\d]*([\d]+\.[\d]{2})"], float),
+        "cod_charge":               cod_charge,
+        "other_charges":            None,
+        "igst_rate":                igst_rate,
+        "igst_amount":              igst_amount,
+        "cgst_amount":              find([r"cgst\D{0,10}([\d]+\.[\d]{2})"], float),
+        "sgst_amount":              find([r"sgst\D{0,10}([\d]+\.[\d]{2})"], float),
+        "total_gst":                None,
+        "subtotal":                 subtotal,
+        "grand_total":              grand_total,
+        "amount_due":               find([r"amount\s*due\D{0,5}([\d]+\.[\d]{2})"], float),
+        "order_value":              find([r"(?:order|declared)\s*value[:\s]*([\d,]+\.?\d*)"], float),
+        "hsn_codes":                re.findall(r"\b(\d{6})\b", text)[:5],
+        "mystery_line_items":       list(set(mystery))[:5],
+        "invoice_status":           "PAID" if re.search(r"\bpaid\b", text, re.I) else ("UNPAID" if re.search(r"\bunpaid\b", text, re.I) else None),
+        "state_of_supply":          find([r"place\s*of\s*supply[:\s]*([A-Za-z]+(?:\s[A-Za-z]+)?)"]),
+        "reverse_charge":           bool(re.search(r"reverse\s*charge[:\s]*yes", text, re.I)),
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
