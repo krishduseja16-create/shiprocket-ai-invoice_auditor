@@ -263,9 +263,11 @@ def parse_regex_fallback(text: str) -> dict:
     charges = [c for c in [freight, excess, cod_charge, zone_upgrade] if c is not None]
     if charges:
         subtotal = round(sum(charges), 2)
-    # Better fallback: derive from grand_total - igst_amount (always mathematically correct)
-    if (not subtotal or subtotal < 10) and grand_total and igst_amount:
-        subtotal = round(grand_total - igst_amount, 2)
+    # Better fallback: if subtotal looks incomplete (less than grand_total - igst), use math
+    if grand_total and igst_amount:
+        correct_subtotal = round(grand_total - igst_amount, 2)
+        if not subtotal or subtotal < correct_subtotal * 0.8:
+            subtotal = correct_subtotal
 
     return {
         "invoice_number":           find([r"invoice\s*no\.?\s*[:\s]*([A-Z0-9\/\-]+)"]),
