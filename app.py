@@ -137,33 +137,55 @@ def parse_regex_fallback(text: str) -> dict:
                     continue
         return None
 
-    # ── Payment mode — COD checked strictly first ─────────────────────────
+    # ── Payment mode — only read from Payment Mode column, not charge lines ─
     payment_mode = None
-    # Check shipment details table row for payment mode
-    pm_match = re.search(r"(prepaid|cod|cash\s*on\s*delivery)", text, re.I)
+    # Look specifically for "Payment Mode" label followed by COD or Prepaid
+    pm_match = re.search(r"payment\s*mode\s*[:\s]*([A-Za-z]+)", text, re.I)
     if pm_match:
-        pm_val = pm_match.group(1).lower()
-        payment_mode = "COD" if "cod" in pm_val or "cash" in pm_val else "Prepaid"
+        pm_val = pm_match.group(1).strip().lower()
+        payment_mode = "COD" if "cod" in pm_val else "Prepaid" if "prepaid" in pm_val else None
+    # Fallback: look for standalone Prepaid/COD not preceded by "charge" or "handling"
+    if not payment_mode:
+        for line in text.split("\n"):
+            line_l = line.strip().lower()
+            if re.search(r"\bprepaid\b", line_l) and "charge" not in line_l:
+                payment_mode = "Prepaid"
+                break
+            if re.search(r"\bcod\b", line_l) and "charge" not in line_l and "handling" not in line_l:
+                payment_mode = "COD"
+                break
 
     # ── Courier ───────────────────────────────────────────────────────────
     courier = find([r"\b(bluedart|blue\s*dart|delhivery|xpressbees|ecom\s*express|dotzot|ekart|dtdc|shadowfax)\b"])
 
-    # ── Client name — look for company name after "Invoice To:" ───────────
-    # Strategy: find "Invoice To:" then grab the next line that looks like a company
+    # ── Client name — scan lines after "Invoice To:" ────────────────────
     client_name = None
-    invoice_to_match = re.search(
-        r"invoice\s*to[:\s]*\n(.*?)\n", text, re.I | re.M)
-    if invoice_to_match:
-        candidate = invoice_to_match.group(1).strip()
-        # Must be a real company name — not a label like "State Code" or short word
-        if (len(candidate) > 5
-                and not re.match(r"^(state|place|gstin|reverse|code|supply)", candidate, re.I)):
-            client_name = candidate
-    # Fallback: look for "Pvt Ltd" / "Ltd" pattern anywhere
+    lines = text.split("\n")
+    inv_to_idx = -1
+    for i, line in enumerate(lines):
+        if re.search(r"invoice\s*to", line, re.I):
+            inv_to_idx = i
+            break
+    if inv_to_idx >= 0:
+        for line in lines[inv_to_idx+1 : inv_to_idx+5]:
+            candidate = line.strip()
+            if (len(candidate) > 5
+                    and not re.match(
+                        r"^(state|place|gstin|reverse|code|supply|invoice|building|"
+                        r"plot|flat|road|street|ph|phone|email|pan|cin|x\s|paid)",
+                        candidate, re.I)
+                    and not re.match(r"^\d", candidate)
+                    and not re.search(r"@|\d{6,}", candidate)):
+                client_name = candidate
+                break
+    # Fallback: find any "Pvt Ltd" name that is NOT BigFoot/Shiprocket
     if not client_name:
-        m = re.search(r"([A-Z][A-Za-z\s]{3,40}(?:Pvt\.?\s*Ltd|Limited|LLP|Inc))", text)
-        if m:
-            client_name = m.group(1).strip()
+        matches = re.findall(
+            r"([A-Z][A-Za-z\s]{3,40}(?:Pvt\.?\s*Ltd|Limited|LLP|Inc))", text)
+        for mx in matches:
+            if "bigfoot" not in mx.lower() and "shiprocket" not in mx.lower():
+                client_name = mx.strip()
+                break
 
     # ── Client GSTIN — pick the second GSTIN (first is vendor's) ─────────
     all_gstins = re.findall(
@@ -217,7 +239,7 @@ def parse_regex_fallback(text: str) -> dict:
                 mystery.append(label)
 
     # ── IGST rate & amount ────────────────────────────────────────────────
-    igst_rate = find([r"(\d+\.?\d*)\s*%\s*igst", r"igst\s*@\s*(\d+\.?\d*)"], float)
+    igst_rate = find([r"(\d{1,2}(?:\.\d{1,2})?)\s*%\s*igst", r"igst\s*@\s*(\d{1,2}(?:\.\d{1,2})?)"], float)
     igst_amount = find([
         r"\d+\.?\d*\s*%\s*igst\D{0,5}([\d]+\.[\d]{2})",
         r"igst\D{0,10}([\d]+\.[\d]{2})",
@@ -268,7 +290,7 @@ def parse_regex_fallback(text: str) -> dict:
         "hsn_codes":                re.findall(r"\b(\d{6})\b", text)[:5],
         "mystery_line_items":       list(set(mystery))[:5],
         "invoice_status":           "PAID" if re.search(r"\bpaid\b", text, re.I) else ("UNPAID" if re.search(r"\bunpaid\b", text, re.I) else None),
-        "state_of_supply":          find([r"place\s*of\s*supply[:\s]*([A-Za-z]+(?:\s[A-Za-z]+)?)"]),
+        "state_of_supply":          find([r"place\s*of\s*supply[:\s]*([A-Za-z]+(?:\s(?!No\b|Building\b|Plot\b|Road\b|Street\b)[A-Za-z]+)?)"]),
         "reverse_charge":           bool(re.search(r"reverse\s*charge[:\s]*yes", text, re.I)),
     }
 
@@ -795,10 +817,16 @@ if run_btn and invoice_files:
                 icon  = icon_map.get(field, "•")
                 label = field.replace("_"," ").title()
                 if isinstance(value, float):
-                    disp = (f"₹{value:,.2f}"
-                            if any(x in field for x in ("charge","total","amount","value","gst","subtotal"))
-                            else f"{value} kg" if "weight" in field
-                            else f"{value}%")
+                    if "igst_rate" in field or field == "igst_rate":
+                        disp = f"{value:.0f}%"
+                    elif any(x in field for x in ("charge","total","amount","value","gst","subtotal")):
+                        disp = f"₹{value:,.2f}"
+                    elif "weight" in field:
+                        disp = f"{value} kg"
+                    elif "rate" in field:
+                        disp = f"{value:.0f}%"
+                    else:
+                        disp = f"{value}"
                 else:
                     disp = str(value)
                 st.markdown(
