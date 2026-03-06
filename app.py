@@ -263,6 +263,9 @@ def parse_regex_fallback(text: str) -> dict:
     charges = [c for c in [freight, excess, cod_charge, zone_upgrade] if c is not None]
     if charges:
         subtotal = round(sum(charges), 2)
+    # Better fallback: derive from grand_total - igst_amount (always mathematically correct)
+    if (not subtotal or subtotal < 10) and grand_total and igst_amount:
+        subtotal = round(grand_total - igst_amount, 2)
 
     return {
         "invoice_number":           find([r"invoice\s*no\.?\s*[:\s]*([A-Z0-9\/\-]+)"]),
@@ -824,12 +827,12 @@ if run_btn and invoice_files:
                 if isinstance(value, float):
                     if "igst_rate" in field or field == "igst_rate":
                         disp = f"{value:.0f}%"
-                    elif any(x in field for x in ("charge","total","amount","value","gst","subtotal")):
-                        disp = f"₹{value:,.2f}"
                     elif "weight" in field:
                         disp = f"{value:.1f} kg"
                     elif "rate" in field:
                         disp = f"{value:.0f}%"
+                    elif any(x in field for x in ("charge","total","amount","value","gst","subtotal")):
+                        disp = f"₹{value:,.2f}"
                     else:
                         disp = f"{value}"
                 else:
