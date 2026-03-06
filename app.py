@@ -176,7 +176,9 @@ def parse_regex_fallback(text: str) -> dict:
                         candidate, re.I)
                     and not re.match(r"^\d", candidate)
                     and not re.search(r"@|\d{6,}", candidate)):
-                client_name = candidate
+                # Trim anything after "Pvt Ltd" / "Limited" / "LLP"
+                m = re.match(r"(.*?(?:Pvt\.?\s*Ltd\.?|Limited|LLP|Inc\.?))", candidate, re.I)
+                client_name = m.group(1).strip() if m else candidate
                 break
     # Fallback: find any "Pvt Ltd" name that is NOT BigFoot/Shiprocket
     if not client_name:
@@ -233,7 +235,11 @@ def parse_regex_fallback(text: str) -> dict:
                 and not any(k in line_clean for k in known_patterns)
                 and not re.match(r"^\d", line_clean)
                 and "sac" not in line_clean
-                and "description" not in line_clean):
+                and "description" not in line_clean
+                and "error" not in line_clean
+                and "test invoice" not in line_clean
+                and "invoice was generated" not in line_clean
+                and line_clean.count("•") == 0):
             label = re.sub(r"[\d\.\,₹\s]+$", "", line.strip()).strip()
             if label and len(label) > 5:
                 mystery.append(label)
@@ -253,9 +259,8 @@ def parse_regex_fallback(text: str) -> dict:
 
     # ── Subtotal (sum of charges before GST) ──────────────────────────────
     subtotal = None
-    charges = [c for c in [freight, excess, cod_charge,
-                            find([r"zone\s*upgrade[^\d]*([\d]+\.[\d]{2})"], float)]
-               if c is not None]
+    zone_upgrade = find([r"zone\s*upgrade[^\d]*([\d]+\.[\d]{2})"], float)
+    charges = [c for c in [freight, excess, cod_charge, zone_upgrade] if c is not None]
     if charges:
         subtotal = round(sum(charges), 2)
 
@@ -822,7 +827,7 @@ if run_btn and invoice_files:
                     elif any(x in field for x in ("charge","total","amount","value","gst","subtotal")):
                         disp = f"₹{value:,.2f}"
                     elif "weight" in field:
-                        disp = f"{value} kg"
+                        disp = f"{value:.1f} kg"
                     elif "rate" in field:
                         disp = f"{value:.0f}%"
                     else:
